@@ -1,6 +1,6 @@
 import { useState } from 'react';
 
-const CORRECT_PASSWORD = import.meta.env.VITE_APP_PASSWORD || 'futurist';
+const CORRECT_PASSWORD = (import.meta as unknown as { env: Record<string, string> }).env.VITE_APP_PASSWORD || 'futurist';
 const SESSION_KEY = 'ff_auth';
 
 export function isAuthenticated(): boolean {

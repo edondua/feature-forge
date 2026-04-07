@@ -14,7 +14,6 @@ function generateId(): string {
 export default function Tool() {
   const {
     projectId,
-    userId,
     api,
     showToast,
   } = useToolContext();
