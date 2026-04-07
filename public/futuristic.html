@@ -796,6 +796,14 @@
     }
   </style>
 </head>
+<script>
+  // Password gate — must be authenticated via the main app first
+  if (sessionStorage.getItem('ff_auth') !== '1') {
+    sessionStorage.setItem('ff_redirect', 'futuristic.html');
+    window.location.replace('/');
+  }
+</script>
+
 <body>
 
 <!-- ============================================================ NAV -->

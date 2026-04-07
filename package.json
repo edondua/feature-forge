@@ -12,6 +12,7 @@
     "screenshots:watch": "node scripts/screenshot-watcher.mjs --watch",
     "verify:federated-css": "node ./scripts/verify-federated-css.mjs",
     "build": "npm run verify:federated-css && tsc && vite build",
+    "build:standalone": "tsc --noEmit && vite build --config vite.preview.ts",
     "typecheck": "tsc --noEmit",
     "preview": "vite preview",
     "start": "node server.js"
