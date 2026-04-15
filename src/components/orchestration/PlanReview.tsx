@@ -1,10 +1,15 @@
 import { useState } from 'react';
 import { Card, CardContent, CardHeader, CardTitle, Button, Badge } from '@appmirror/ui-kit';
-import type { OrchestrationPlan } from '../../types';
+import type { OrchestrationPlan, DesignAnnotation, TechAnnotation } from '../../types';
 import { LANE_CONFIG, LANE_ORDER } from './constants';
 import LaneColumn from './LaneColumn';
 import TaskGraphView from './TaskGraphView';
 import TaskNodeCard from './TaskNodeCard';
+import DesignAnnotationForm from './DesignAnnotationForm';
+import TechAnnotationForm from './TechAnnotationForm';
+import ActivityFeed from './ActivityFeed';
+
+export type PhaseMode = 'review' | 'design' | 'tech';
 
 interface PlanReviewProps {
   plan: OrchestrationPlan;
@@ -12,11 +17,13 @@ interface PlanReviewProps {
   onRefine: (feedback: string) => void;
   onUpdatePlan: (plan: OrchestrationPlan) => void;
   refining: boolean;
+  approveLabel?: string;
+  phaseMode?: PhaseMode;
 }
 
 type Tab = 'summary' | 'lanes' | 'graph';
 
-export default function PlanReview({ plan, onApprove, onRefine, onUpdatePlan, refining }: PlanReviewProps) {
+export default function PlanReview({ plan, onApprove, onRefine, onUpdatePlan, refining, approveLabel, phaseMode = 'review' }: PlanReviewProps) {
   const [tab, setTab] = useState<Tab>('lanes');
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const [feedback, setFeedback] = useState('');
@@ -69,13 +76,23 @@ export default function PlanReview({ plan, onApprove, onRefine, onUpdatePlan, re
       {/* Header */}
       <div className="flex items-center justify-between">
         <div>
-          <h2 className="text-xl font-bold">Review Execution Plan</h2>
+          <h2 className="text-xl font-bold">
+            {phaseMode === 'design' ? 'Design Specification' : phaseMode === 'tech' ? 'Technical Definition' : 'Review Execution Plan'}
+          </h2>
           <p className="text-muted-foreground text-sm">{plan.intake.title}</p>
+          {phaseMode === 'design' && (
+            <p className="text-xs text-blue-500 mt-1">Add Figma links, UI specs, and interaction notes to relevant tasks</p>
+          )}
+          {phaseMode === 'tech' && (
+            <p className="text-xs text-purple-500 mt-1">Add implementation notes, estimates, and raise technical challenges</p>
+          )}
         </div>
         <div className="flex gap-2">
-          <Button variant="primary" onClick={onApprove}>
-            Approve Plan
-          </Button>
+          {phaseMode !== 'review' && (
+            <Badge variant="secondary" className="text-xs">
+              {phaseMode === 'design' ? 'Design Phase' : 'Tech Phase'}
+            </Badge>
+          )}
         </div>
       </div>
 
@@ -296,6 +313,28 @@ export default function PlanReview({ plan, onApprove, onRefine, onUpdatePlan, re
                     })}
                   </div>
                 )}
+
+                {/* Design annotation — show editable in design phase, read-only if annotation exists in other phases */}
+                {(phaseMode === 'design' || selectedTask.designAnnotation) && (
+                  <DesignAnnotationForm
+                    annotation={selectedTask.designAnnotation}
+                    readOnly={phaseMode !== 'design'}
+                    onSave={(annotation: DesignAnnotation) => {
+                      handleUpdateTask({ ...selectedTask, designAnnotation: annotation });
+                    }}
+                  />
+                )}
+
+                {/* Tech annotation — show editable in tech phase, read-only if annotation exists in other phases */}
+                {(phaseMode === 'tech' || selectedTask.techAnnotation) && (
+                  <TechAnnotationForm
+                    annotation={selectedTask.techAnnotation}
+                    readOnly={phaseMode !== 'tech'}
+                    onSave={(annotation: TechAnnotation) => {
+                      handleUpdateTask({ ...selectedTask, techAnnotation: annotation });
+                    }}
+                  />
+                )}
               </CardContent>
             </Card>
           )}
@@ -331,6 +370,15 @@ export default function PlanReview({ plan, onApprove, onRefine, onUpdatePlan, re
               )}
             </CardContent>
           </Card>
+
+          {/* Activity feed */}
+          {plan.activityLog && plan.activityLog.length > 0 && (
+            <Card>
+              <CardContent className="p-3">
+                <ActivityFeed activities={plan.activityLog} />
+              </CardContent>
+            </Card>
+          )}
         </div>
       </div>
       {/* Sticky bottom approve bar */}
@@ -342,7 +390,7 @@ export default function PlanReview({ plan, onApprove, onRefine, onUpdatePlan, re
           )}
         </p>
         <Button variant="primary" onClick={onApprove}>
-          Approve & Push to Linear
+          {approveLabel || 'Approve & Push to Linear'}
         </Button>
       </div>
     </div>

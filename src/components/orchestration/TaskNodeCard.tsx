@@ -162,6 +162,16 @@ export default function TaskNodeCard({ task, selected, compact, onClick, onUpdat
             {task.serviceId && task.serviceId !== 'none' && (
               <Badge variant="secondary" className="text-[10px]">{task.serviceId}</Badge>
             )}
+            {task.designAnnotation && (
+              <span className="text-[10px] px-1 rounded bg-blue-100 text-blue-700 dark:bg-blue-900 dark:text-blue-300" title="Has design spec">
+                Design
+              </span>
+            )}
+            {task.techAnnotation && (
+              <span className="text-[10px] px-1 rounded bg-purple-100 text-purple-700 dark:bg-purple-900 dark:text-purple-300" title="Has tech notes">
+                Tech{task.techAnnotation.estimateHours ? ` ${task.techAnnotation.estimateHours}h` : ''}
+              </span>
+            )}
             {task.dependsOn.length > 0 && (
               <span className="text-[10px] text-muted-foreground">{task.dependsOn.length} deps</span>
             )}

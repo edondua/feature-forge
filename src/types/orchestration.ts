@@ -29,6 +29,82 @@ export type ExecutionLane =
   | 'infra'
   | 'release';
 
+// ── Roles & Phases ──────────────────────────────────────────────
+export type PlanRole = 'po' | 'designer' | 'dev';
+
+export type PlanPhase =
+  | 'product-definition'
+  | 'design-specification'
+  | 'technical-definition'
+  | 'approval'
+  | 'pushed';
+
+export interface PhaseStatus {
+  phase: PlanPhase;
+  status: 'pending' | 'in-progress' | 'complete';
+  completedBy?: string;
+  completedAt?: string;
+}
+
+export interface PlanActivity {
+  id: string;
+  actor: string;
+  action: string;
+  timestamp: string;
+}
+
+// ── Annotations ─────────────────────────────────────────────────
+export interface DesignAnnotation {
+  figmaUrl?: string;
+  uiSpecs?: string;
+  interactionNotes?: string;
+  addedBy: string;
+  addedAt: string;
+}
+
+export interface TechAnnotation {
+  implementationNotes?: string;
+  estimateHours?: number;
+  challengesRaised?: string[];
+  addedBy: string;
+  addedAt: string;
+}
+
+// ── Knowledge Context (Source of Truth) ─────────────────────────
+export interface ServiceContext {
+  serviceId: string;
+  claudeMd?: string;
+  techStack: string[];
+  fileTree: string[];
+  apiRoutes?: string[];
+  schemas?: string[];
+  readme?: string;
+}
+
+export interface KnowledgeContext {
+  services: ServiceContext[];
+  designSystem?: {
+    components: string[];
+    patterns: string[];
+  };
+}
+
+// ── Clarifying Questions ────────────────────────────────────────
+export interface ClarifyingOption {
+  label: string;
+  description: string;
+}
+
+export type QuestionCategory = 'architecture' | 'data' | 'ui' | 'integration' | 'rollout';
+
+export interface ClarifyingQuestion {
+  id: string;
+  question: string;
+  category: QuestionCategory;
+  options: ClarifyingOption[];
+  answer?: string;
+}
+
 // ── Feature Intake ──────────────────────────────────────────────
 export interface LinkedReference {
   label: string;
@@ -75,6 +151,8 @@ export interface OrchestrationTask extends FeatureTask {
   acceptanceCriteria: string[];
   riskFlags: RiskFlag[];
   linearIssueUrl?: string;
+  designAnnotation?: DesignAnnotation;
+  techAnnotation?: TechAnnotation;
 }
 
 // ── Task Graph ──────────────────────────────────────────────────
@@ -119,8 +197,11 @@ export interface DesignProposalsResult {
 export type OrchestrationStep =
   | 'intake'
   | 'analyzing'
+  | 'clarify'
   | 'review'
   | 'design-proposals'
+  | 'design-input'
+  | 'tech-input'
   | 'approved'
   | 'pushing'
   | 'pushed';
@@ -139,4 +220,13 @@ export interface OrchestrationPlan {
   reviewNotes: string[];
   createdAt: string;
   updatedAt: string;
+  // Multi-phase collaboration fields
+  currentPhase?: PlanPhase;
+  phases?: PhaseStatus[];
+  activityLog?: PlanActivity[];
+  createdBy?: string;
+  project_id?: string;
+  // Source of truth
+  knowledgeContext?: KnowledgeContext;
+  clarifyingQuestions?: ClarifyingQuestion[];
 }

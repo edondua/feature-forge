@@ -2,6 +2,17 @@
 export type {
   AffectedSurface,
   ExecutionLane,
+  PlanRole,
+  PlanPhase,
+  PhaseStatus,
+  PlanActivity,
+  DesignAnnotation,
+  TechAnnotation,
+  ServiceContext,
+  KnowledgeContext,
+  ClarifyingOption,
+  QuestionCategory,
+  ClarifyingQuestion,
   LinkedReference,
   WorkType,
   FeatureIntake,
@@ -162,4 +173,5 @@ export type ViewRoute =
   | { view: 'prototype-preview'; featureId: string; state?: ScreenState }
   | { view: 'tasks'; featureId: string }
   | { view: 'orchestrate'; featureId?: string }
-  | { view: 'orchestrate-review'; planId: string };
+  | { view: 'orchestrate-review'; planId: string }
+  | { view: 'plan'; planId: string; role?: import('./orchestration').PlanRole };

@@ -178,6 +178,18 @@ export default function LinearPushPanel({ plan, apiBase, onPushComplete }: Linea
               <div>1 project: <strong>{plan.intake.title}</strong></div>
               <div>{plan.tasks.length} issues with dependencies</div>
               <div>{plan.taskGraph.length} dependency relations</div>
+              {(() => {
+                const totalHours = plan.tasks.reduce((sum, t) => sum + (t.techAnnotation?.estimateHours || 0), 0);
+                const designCount = plan.tasks.filter(t => t.designAnnotation).length;
+                const techCount = plan.tasks.filter(t => t.techAnnotation).length;
+                return (
+                  <>
+                    {totalHours > 0 && <div>Total estimate: <strong>{totalHours}h</strong></div>}
+                    {designCount > 0 && <div>{designCount} tasks with design specs</div>}
+                    {techCount > 0 && <div>{techCount} tasks with tech notes</div>}
+                  </>
+                );
+              })()}
             </div>
           </div>
 

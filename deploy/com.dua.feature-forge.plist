@@ -1,23 +1,45 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!-- launchd plist to auto-start Feature Forge server on Mac Mini boot/login -->
-<!-- Install: cp deploy/com.dua.feature-forge.plist ~/Library/LaunchAgents/ -->
-<!--          launchctl load ~/Library/LaunchAgents/com.dua.feature-forge.plist -->
+<!--
+  Feature Forge — launchd service for Mac Mini
+  Auto-starts on boot/login, auto-restarts on crash.
+
+  BEFORE INSTALLING: Edit the paths below to match your Mac Mini setup:
+    1. Replace INSTALL_DIR with the path to this repo (e.g. /Users/edon/feature-forge)
+    2. Replace NODE_PATH with your Node.js path (run: which node)
+
+  Install:
+    cp deploy/com.dua.feature-forge.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.dua.feature-forge.plist
+
+  Uninstall:
+    launchctl unload ~/Library/LaunchAgents/com.dua.feature-forge.plist
+    rm ~/Library/LaunchAgents/com.dua.feature-forge.plist
+
+  Logs:
+    tail -f /tmp/feature-forge.log
+    tail -f /tmp/feature-forge.error.log
+-->
 <plist version="1.0">
 <dict>
   <key>Label</key>
   <string>com.dua.feature-forge</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/usr/local/bin/node</string>
-    <string>/Users/doruntinaramadani/appmirror-tool-starter/server.js</string>
+    <!-- Update NODE_PATH: run 'which node' on Mac Mini to find this -->
+    <string>/opt/homebrew/bin/node</string>
+    <!-- Update INSTALL_DIR to where this repo lives -->
+    <string>/Users/edon/feature-forge/server.js</string>
   </array>
   <key>WorkingDirectory</key>
-  <string>/Users/doruntinaramadani/appmirror-tool-starter</string>
+  <!-- Update INSTALL_DIR to where this repo lives -->
+  <string>/Users/edon/feature-forge</string>
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>
-    <string>/usr/local/bin:/usr/bin:/bin</string>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>NODE_ENV</key>
+    <string>production</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>

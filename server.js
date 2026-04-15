@@ -269,15 +269,217 @@ const FALLBACK_SERVICES = [
   { id: 'shared-lib', name: 'shared-lib', description: 'Shared types, utilities, protocol buffers', lane: 'shared-lib' },
 ];
 
-function buildSystemPrompt(services) {
+// ── Knowledge Context Extraction (Source of Truth) ──────────────
+
+async function extractKnowledgeFromLocal(localPath, services) {
+  const contexts = [];
+  for (const svc of services) {
+    const dir = joinPath(localPath, svc.id);
+    if (!existsSync(dir)) continue;
+
+    const ctx = { serviceId: svc.id, techStack: [], fileTree: [], apiRoutes: [], schemas: [] };
+
+    // Full CLAUDE.md
+    const claudePath = joinPath(dir, 'CLAUDE.md');
+    if (existsSync(claudePath)) {
+      try { ctx.claudeMd = readFileSync(claudePath, 'utf8').slice(0, 3000); } catch {}
+    }
+
+    // README (first 500 chars)
+    const readmePath = joinPath(dir, 'README.md');
+    if (existsSync(readmePath)) {
+      try { ctx.readme = readFileSync(readmePath, 'utf8').slice(0, 500); } catch {}
+    }
+
+    // Tech stack from package.json
+    const pkgPath = joinPath(dir, 'package.json');
+    if (existsSync(pkgPath)) {
+      try {
+        const pkg = JSON.parse(readFileSync(pkgPath, 'utf8'));
+        const deps = Object.keys(pkg.dependencies || {});
+        const devDeps = Object.keys(pkg.devDependencies || {});
+        ctx.techStack = [...deps, ...devDeps].slice(0, 40);
+      } catch {}
+    }
+
+    // Scan for key directories and files
+    try {
+      const scanDir = (base, depth = 0) => {
+        if (depth > 2) return;
+        const entries = readdirSync(base, { withFileTypes: true });
+        for (const e of entries) {
+          if (e.name.startsWith('.') || e.name === 'node_modules' || e.name === 'dist' || e.name === 'build') continue;
+          const rel = joinPath(base, e.name).replace(dir + '/', '');
+          if (e.isDirectory()) {
+            // Track key dirs
+            if (/routes|api|controllers|handlers|endpoints/i.test(e.name)) {
+              ctx.apiRoutes.push(rel + '/');
+              // List files in route dirs
+              try {
+                const files = readdirSync(joinPath(base, e.name));
+                files.filter(f => /\.(ts|js|swift|kt)$/.test(f)).forEach(f => ctx.apiRoutes.push(rel + '/' + f));
+              } catch {}
+            }
+            if (/migrations?|schema|models?|entities|prisma|drizzle/i.test(e.name)) {
+              ctx.schemas.push(rel + '/');
+              try {
+                const files = readdirSync(joinPath(base, e.name));
+                files.filter(f => /\.(ts|js|sql|prisma|swift|kt)$/.test(f)).forEach(f => ctx.schemas.push(rel + '/' + f));
+              } catch {}
+            }
+            ctx.fileTree.push(rel + '/');
+            scanDir(joinPath(base, e.name), depth + 1);
+          } else if (/\.(ts|js|swift|kt|sql|prisma|proto)$/.test(e.name) && depth <= 1) {
+            ctx.fileTree.push(rel);
+          }
+        }
+      };
+      scanDir(dir);
+    } catch {}
+
+    // Trim
+    ctx.fileTree = ctx.fileTree.slice(0, 60);
+    ctx.apiRoutes = ctx.apiRoutes.slice(0, 30);
+    ctx.schemas = ctx.schemas.slice(0, 20);
+
+    contexts.push(ctx);
+  }
+  return contexts;
+}
+
+async function extractKnowledgeFromGitNexus(services) {
+  const baseUrl = process.env.GITNEXUS_URL;
+  const token = process.env.GITNEXUS_TOKEN;
+  const org = process.env.GITNEXUS_ORG;
+  if (!baseUrl || !token) return [];
+
+  const headers = { Authorization: `token ${token}`, Accept: 'application/json' };
+  const contexts = [];
+
+  for (const svc of services.slice(0, 10)) {
+    const ctx = { serviceId: svc.id, techStack: [], fileTree: [], apiRoutes: [], schemas: [] };
+    const repoPath = org ? `${org}/${svc.id}` : svc.id;
+
+    // Fetch CLAUDE.md
+    try {
+      const r = await fetch(`${baseUrl}/api/v1/repos/${repoPath}/contents/CLAUDE.md`, { headers, signal: AbortSignal.timeout(5000) });
+      if (r.ok) {
+        const data = await r.json();
+        ctx.claudeMd = Buffer.from(data.content, 'base64').toString('utf8').slice(0, 3000);
+      }
+    } catch {}
+
+    // Fetch README
+    try {
+      const r = await fetch(`${baseUrl}/api/v1/repos/${repoPath}/contents/README.md`, { headers, signal: AbortSignal.timeout(5000) });
+      if (r.ok) {
+        const data = await r.json();
+        ctx.readme = Buffer.from(data.content, 'base64').toString('utf8').slice(0, 500);
+      }
+    } catch {}
+
+    // Fetch package.json
+    try {
+      const r = await fetch(`${baseUrl}/api/v1/repos/${repoPath}/contents/package.json`, { headers, signal: AbortSignal.timeout(5000) });
+      if (r.ok) {
+        const data = await r.json();
+        const pkg = JSON.parse(Buffer.from(data.content, 'base64').toString('utf8'));
+        ctx.techStack = [...Object.keys(pkg.dependencies || {}), ...Object.keys(pkg.devDependencies || {})].slice(0, 40);
+      }
+    } catch {}
+
+    // Fetch file tree
+    try {
+      const branch = svc.defaultBranch || 'main';
+      const r = await fetch(`${baseUrl}/api/v1/repos/${repoPath}/git/trees/${branch}?recursive=true`, { headers, signal: AbortSignal.timeout(8000) });
+      if (r.ok) {
+        const data = await r.json();
+        const entries = (data.tree || []).filter(e => e.type === 'blob').map(e => e.path);
+        ctx.fileTree = entries.filter(f => /\.(ts|js|swift|kt|sql|prisma|proto)$/.test(f)).slice(0, 60);
+        ctx.apiRoutes = entries.filter(f => /routes?|api|controllers?|handlers?|endpoints?/i.test(f)).slice(0, 30);
+        ctx.schemas = entries.filter(f => /migrations?|schema|models?|entities|prisma|drizzle/i.test(f)).slice(0, 20);
+      }
+    } catch {}
+
+    contexts.push(ctx);
+  }
+  return contexts;
+}
+
+async function extractKnowledgeContext(services) {
+  const localPath = process.env.GITNEXUS_LOCAL_PATH;
+
+  // Try local first (much faster)
+  let serviceContexts = [];
+  if (localPath && existsSync(localPath)) {
+    serviceContexts = await extractKnowledgeFromLocal(localPath, services);
+  }
+  // Fall back to GitNexus API
+  if (serviceContexts.length === 0) {
+    serviceContexts = await extractKnowledgeFromGitNexus(services);
+  }
+
+  // Check for design system output from swift-mirror
+  let designSystem = undefined;
+  const schemaPath = joinPath(__dirname, 'src/generated/prototype-schema.json');
+  if (existsSync(schemaPath)) {
+    try {
+      const schema = JSON.parse(readFileSync(schemaPath, 'utf8'));
+      designSystem = {
+        components: (schema.components || schema.screens || []).map(c => c.name || c.id || '').filter(Boolean).slice(0, 30),
+        patterns: (schema.patterns || []).map(p => p.name || p).filter(Boolean).slice(0, 20),
+      };
+    } catch {}
+  }
+
+  return { services: serviceContexts, designSystem };
+}
+
+function buildSystemPrompt(services, knowledgeContext, clarifyingAnswers) {
   const serviceLines = services.map(s =>
     `- ${s.id} (${s.lane}): ${s.description}${s.repoUrl ? ` — ${s.repoUrl}` : ''}`
   ).join('\n');
 
+  // Build knowledge sections from extracted context
+  let knowledgeSections = '';
+  if (knowledgeContext?.services?.length) {
+    const svcSections = knowledgeContext.services
+      .filter(s => s.claudeMd || s.techStack?.length || s.fileTree?.length)
+      .map(s => {
+        const parts = [`### ${s.serviceId}`];
+        if (s.claudeMd) parts.push(`**Context:**\n${s.claudeMd}`);
+        if (s.techStack?.length) parts.push(`**Tech stack:** ${s.techStack.slice(0, 20).join(', ')}`);
+        if (s.fileTree?.length) parts.push(`**Key files:**\n${s.fileTree.slice(0, 25).map(f => `- ${f}`).join('\n')}`);
+        if (s.apiRoutes?.length) parts.push(`**API routes:**\n${s.apiRoutes.slice(0, 15).map(f => `- ${f}`).join('\n')}`);
+        if (s.schemas?.length) parts.push(`**Schemas/Models:**\n${s.schemas.slice(0, 10).map(f => `- ${f}`).join('\n')}`);
+        return parts.join('\n');
+      }).join('\n\n');
+
+    if (svcSections) {
+      knowledgeSections += `\n\n## Codebase Knowledge (Source of Truth)\nThe following is extracted from the actual codebase. Use this to write precise tasks with correct file paths, function names, and patterns.\n\n${svcSections}`;
+    }
+  }
+
+  if (knowledgeContext?.designSystem?.components?.length) {
+    knowledgeSections += `\n\n## Design System Components\nAvailable components: ${knowledgeContext.designSystem.components.join(', ')}`;
+    if (knowledgeContext.designSystem.patterns?.length) {
+      knowledgeSections += `\nPatterns: ${knowledgeContext.designSystem.patterns.join(', ')}`;
+    }
+  }
+
+  // Build approach decisions from clarifying answers
+  let approachSection = '';
+  if (clarifyingAnswers?.length) {
+    const answered = clarifyingAnswers.filter(q => q.answer);
+    if (answered.length) {
+      approachSection = `\n\n## Approach Decisions (team confirmed)\n${answered.map(q => `- **${q.question}** → ${q.answer}`).join('\n')}\n\nYou MUST follow these decisions when generating tasks. Do not contradict them.`;
+    }
+  }
+
   return `You are a senior engineering manager who decomposes work items (features, bugs, maintenance, migrations, improvements, infrastructure) into execution plans across a multi-service tech stack. Adapt your decomposition style to the work type — a bug fix needs precise root-cause tasks, a migration needs data safety steps, a feature needs full user-flow coverage.
 
 ## Available Services
-${serviceLines}
+${serviceLines}${knowledgeSections}${approachSection}
 
 ## Execution Lanes
 - backend: API, database, business logic changes
@@ -354,7 +556,7 @@ Only include lanes that are actually needed.`;
 
 app.post('/api/orchestrate/decompose', async (req, res) => {
   try {
-    const { intake, featureId } = req.body;
+    const { intake, featureId, knowledgeContext, clarifyingAnswers } = req.body;
 
     if (!intake?.title || !intake?.problem) {
       return res.status(400).json({ error: 'Intake must include at least title and problem' });
@@ -363,7 +565,7 @@ app.post('/api/orchestrate/decompose', async (req, res) => {
     // Auto-detect services from GitNexus based on affected surfaces
     const detectedServices = await detectServicesFromGitNexus(intake.affectedSurfaces);
     const services = detectedServices || FALLBACK_SERVICES;
-    const systemPrompt = buildSystemPrompt(services);
+    const systemPrompt = buildSystemPrompt(services, knowledgeContext, clarifyingAnswers);
 
     const client = await getAnthropicClient();
 
@@ -457,6 +659,19 @@ For each task: write the description as a concise implementation brief (what to 
       reviewNotes: [],
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
+      currentPhase: 'product-definition',
+      phases: [
+        { phase: 'product-definition', status: 'in-progress' },
+        { phase: 'design-specification', status: 'pending' },
+        { phase: 'technical-definition', status: 'pending' },
+        { phase: 'approval', status: 'pending' },
+      ],
+      activityLog: [{
+        id: generateId(),
+        actor: 'system',
+        action: 'Plan created via AI decomposition',
+        timestamp: new Date().toISOString(),
+      }],
     };
 
     res.json({ plan });
@@ -509,6 +724,103 @@ Be concise but specific. Infer workType from context if not given.`,
   } catch (err) {
     console.error('Enrich error:', err);
     res.status(500).json({ error: err.message || 'Enrichment failed' });
+  }
+});
+
+// ── Extract Context: pull knowledge from repos (Source of Truth) ─
+app.post('/api/orchestrate/extract-context', async (req, res) => {
+  try {
+    const { affectedSurfaces } = req.body;
+
+    const detectedServices = await detectServicesFromGitNexus(affectedSurfaces);
+    const services = detectedServices || FALLBACK_SERVICES;
+    const context = await extractKnowledgeContext(services);
+
+    res.json({ context, source: process.env.GITNEXUS_LOCAL_PATH ? 'local' : process.env.GITNEXUS_URL ? 'gitnexus' : 'fallback' });
+  } catch (err) {
+    console.error('Extract context error:', err);
+    res.status(500).json({ error: err.message || 'Context extraction failed' });
+  }
+});
+
+// ── Clarify: generate approach questions from codebase knowledge ─
+app.post('/api/orchestrate/clarify', async (req, res) => {
+  try {
+    const { intake, context } = req.body;
+
+    if (!intake?.title) {
+      return res.status(400).json({ error: 'Intake is required' });
+    }
+
+    const client = await getAnthropicClient();
+
+    // Build knowledge summary for the prompt
+    const knowledgeSummary = (context?.services || []).map(s => {
+      const parts = [`**${s.serviceId}**`];
+      if (s.claudeMd) parts.push(s.claudeMd.slice(0, 800));
+      if (s.techStack?.length) parts.push(`Tech: ${s.techStack.slice(0, 15).join(', ')}`);
+      if (s.apiRoutes?.length) parts.push(`API routes: ${s.apiRoutes.slice(0, 10).join(', ')}`);
+      if (s.schemas?.length) parts.push(`Schemas: ${s.schemas.slice(0, 8).join(', ')}`);
+      return parts.join('\n');
+    }).join('\n\n');
+
+    const designSummary = context?.designSystem?.components?.length
+      ? `\nDesign system components: ${context.designSystem.components.join(', ')}`
+      : '';
+
+    const response = await client.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 4096,
+      system: `You are a senior tech lead reviewing a feature before work begins. You have access to the actual codebase context below. Your job is to generate 3-6 critical approach questions that the team must answer before implementation begins.
+
+Each question should:
+- Present 2-3 concrete options based on what you see in the codebase
+- Focus on architecture, data modeling, integration patterns, or rollout strategy — NOT requirements clarification
+- Reference actual services, files, tables, or components you see in the codebase
+- Include tradeoffs for each option
+
+Return ONLY valid JSON:
+{
+  "questions": [
+    {
+      "id": "q1",
+      "question": "Where should we store user preferences?",
+      "category": "data",
+      "options": [
+        { "label": "Extend user_profiles table", "description": "Simpler, but couples preferences to profile schema" },
+        { "label": "New preferences table", "description": "Clean separation, but adds a join for every profile fetch" }
+      ]
+    }
+  ]
+}
+
+Categories: architecture, data, ui, integration, rollout`,
+      messages: [{
+        role: 'user',
+        content: `## Feature to implement
+- Title: ${intake.title}
+- Problem: ${intake.problem}
+- Goal: ${intake.goal}
+- Affected surfaces: ${(intake.affectedSurfaces || []).join(', ')}
+- In scope: ${(intake.inScope || []).join(', ')}
+
+## Codebase Knowledge
+${knowledgeSummary || '(No codebase context available — generate questions based on general best practices)'}
+${designSummary}
+
+Generate 3-6 approach questions that will lead to better implementation decisions.`,
+      }],
+    });
+
+    const text = response.content.find(c => c.type === 'text')?.text || '';
+    const match = text.match(/\{[\s\S]*\}/);
+    if (!match) return res.status(500).json({ error: 'Failed to parse AI response' });
+
+    const parsed = JSON.parse(match[0]);
+    res.json({ questions: parsed.questions || [] });
+  } catch (err) {
+    console.error('Clarify error:', err);
+    res.status(500).json({ error: err.message || 'Clarification failed' });
   }
 });
 
@@ -782,12 +1094,29 @@ app.post('/api/orchestrate/push-to-linear', async (req, res) => {
         const acList = task.acceptanceCriteria.map(ac => `- [ ] ${ac}`).join('\n');
         const riskList = task.riskFlags.map(rf => `- **${rf.severity.toUpperCase()}** [${rf.type}]: ${rf.description}`).join('\n');
 
+        // Build design & tech annotation sections if present
+        const designSection = task.designAnnotation ? [
+          `### Design Spec`,
+          task.designAnnotation.figmaUrl ? `**Figma:** ${task.designAnnotation.figmaUrl}` : '',
+          task.designAnnotation.uiSpecs ? `**UI Specs:**\n${task.designAnnotation.uiSpecs}` : '',
+          task.designAnnotation.interactionNotes ? `**Interaction Notes:**\n${task.designAnnotation.interactionNotes}` : '',
+        ].filter(Boolean).join('\n') : '';
+
+        const techSection = task.techAnnotation ? [
+          `### Tech Notes`,
+          task.techAnnotation.implementationNotes ? task.techAnnotation.implementationNotes : '',
+          task.techAnnotation.estimateHours ? `**Estimate:** ${task.techAnnotation.estimateHours}h` : '',
+          task.techAnnotation.challengesRaised?.length ? `**Challenges:**\n${task.techAnnotation.challengesRaised.map(c => `- ${c}`).join('\n')}` : '',
+        ].filter(Boolean).join('\n') : '';
+
         const description = [
           task.description,
           '',
           `### Acceptance Criteria`,
           acList,
           riskList ? `\n### Risk Flags\n${riskList}` : '',
+          designSection ? `\n${designSection}` : '',
+          techSection ? `\n${techSection}` : '',
           '',
           `**Lane:** ${task.lane}`,
           task.serviceId !== 'none' ? `**Service:** ${task.serviceId}` : '',

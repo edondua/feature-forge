@@ -1,9 +1,10 @@
 import { useState, useEffect, useCallback } from 'react';
 import { useToolContext } from '@appmirror/ui-kit';
-import type { Feature, FeatureTask, ViewRoute, OrchestrationPlan } from './types';
+import type { Feature, FeatureTask, ViewRoute, OrchestrationPlan, PlanRole } from './types';
 import FeatureList from './components/FeatureList';
 import FeatureDetail from './components/FeatureDetail';
 import OrchestrationWizard from './components/orchestration/OrchestrationWizard';
+import SharedPlanView from './components/orchestration/SharedPlanView';
 
 // ── Helpers ──────────────────────────────────────────────────────
 function generateId(): string {
@@ -20,6 +21,7 @@ export default function Tool() {
 
   const [route, setRoute] = useState<ViewRoute>({ view: 'list' });
   const [features, setFeatures] = useState<Feature[]>([]);
+  const [plans, setPlans] = useState<OrchestrationPlan[]>([]);
   const [loading, setLoading] = useState(true);
 
   // ── Load features from toolsDb ─────────────────────────────────
@@ -28,23 +30,39 @@ export default function Tool() {
       const response = await api.get<{ data: Feature[] }>(`/feature-forge/features?project_id=${projectId}`);
       setFeatures(response.data || []);
     } catch {
-      // First load — no data yet, that's fine
       setFeatures([]);
-    } finally {
-      setLoading(false);
+    }
+  }, [projectId, api]);
+
+  // ── Load plans from toolsDb ────────────────────────────────────
+  const loadPlans = useCallback(async () => {
+    try {
+      const response = await api.get<{ data: OrchestrationPlan[] }>(`/feature-forge/plans?project_id=${projectId}`);
+      setPlans(response.data || []);
+    } catch {
+      setPlans([]);
     }
   }, [projectId, api]);
 
   useEffect(() => {
-    loadFeatures();
-  }, [loadFeatures]);
+    Promise.all([loadFeatures(), loadPlans()]).finally(() => setLoading(false));
+  }, [loadFeatures, loadPlans]);
+
+  // ── Check URL params for shareable plan links ──────────────────
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const planId = params.get('planId');
+    const role = params.get('role') as PlanRole | null;
+    if (planId) {
+      setRoute({ view: 'plan', planId, role: role || undefined });
+    }
+  }, []);
 
   // ── Persist a feature ──────────────────────────────────────────
   const saveFeature = async (feature: Feature) => {
     try {
       await api.put(`/feature-forge/features/${feature.id}`, feature);
     } catch {
-      // If put fails, try post (new record)
       try {
         await api.post('/feature-forge/features', feature);
       } catch (err) {
@@ -53,6 +71,31 @@ export default function Tool() {
       }
     }
   };
+
+  // ── Persist a plan ─────────────────────────────────────────────
+  const savePlan = useCallback(async (plan: OrchestrationPlan) => {
+    const planWithProject = { ...plan, project_id: projectId, updatedAt: new Date().toISOString() };
+    // Update local state
+    setPlans(prev => {
+      const idx = prev.findIndex(p => p.id === plan.id);
+      if (idx >= 0) {
+        const next = [...prev];
+        next[idx] = planWithProject;
+        return next;
+      }
+      return [...prev, planWithProject];
+    });
+    // Persist to toolsDb
+    try {
+      await api.put(`/feature-forge/plans/${plan.id}`, planWithProject);
+    } catch {
+      try {
+        await api.post('/feature-forge/plans', planWithProject);
+      } catch (err) {
+        console.error('Failed to save plan:', err);
+      }
+    }
+  }, [api, projectId]);
 
   // ── Feature CRUD ───────────────────────────────────────────────
   const handleUpdateFeature = async (featureId: string, updates: Partial<Feature>) => {
@@ -152,6 +195,7 @@ export default function Tool() {
         <OrchestrationWizard
           featureId={route.featureId}
           apiBase={orchestrationApiBase}
+          onSavePlan={savePlan}
           onComplete={(plan) => {
             handleOrchestrationComplete(plan);
             if (plan.featureId) {
@@ -163,6 +207,55 @@ export default function Tool() {
           onCancel={() => setRoute({ view: 'list' })}
         />
       )}
+
+      {route.view === 'plan' && (() => {
+        const plan = plans.find(p => p.id === route.planId);
+        if (!plan) {
+          return (
+            <div className="text-center py-16">
+              <p className="text-muted-foreground">Plan not found</p>
+              <button onClick={() => setRoute({ view: 'list' })} className="text-primary mt-2 text-sm">
+                Back to list
+              </button>
+            </div>
+          );
+        }
+        // Determine if the user can edit based on role matching current phase
+        const rolePhaseMap: Record<string, string> = {
+          po: 'product-definition',
+          designer: 'design-specification',
+          dev: 'technical-definition',
+        };
+        const canEdit = route.role && plan.currentPhase === rolePhaseMap[route.role];
+
+        if (canEdit) {
+          return (
+            <OrchestrationWizard
+              featureId={plan.featureId}
+              apiBase={orchestrationApiBase}
+              initialPlan={plan}
+              currentRole={route.role}
+              onSavePlan={savePlan}
+              onComplete={(updated) => {
+                handleOrchestrationComplete(updated);
+                if (updated.featureId) {
+                  setRoute({ view: 'detail', featureId: updated.featureId });
+                } else {
+                  setRoute({ view: 'list' });
+                }
+              }}
+              onCancel={() => setRoute({ view: 'list' })}
+            />
+          );
+        }
+        return (
+          <SharedPlanView
+            plan={plan}
+            role={route.role}
+            onBack={() => setRoute({ view: 'list' })}
+          />
+        );
+      })()}
 
       {route.view === 'detail' && (() => {
         const feature = features.find(f => f.id === route.featureId);
