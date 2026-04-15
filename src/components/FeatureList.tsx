@@ -6,6 +6,7 @@ interface FeatureListProps {
   features: Feature[];
   onSelect: (featureId: string) => void;
   onOrchestrate: () => void;
+  onDesignAudit: () => void;
 }
 
 const STATUS_LABELS: Record<string, { label: string; variant: 'primary' | 'secondary' }> = {
@@ -17,7 +18,7 @@ const STATUS_LABELS: Record<string, { label: string; variant: 'primary' | 'secon
   shipped:     { label: 'Shipped',     variant: 'primary' },
 };
 
-export default function FeatureList({ features, onSelect, onOrchestrate }: FeatureListProps) {
+export default function FeatureList({ features, onSelect, onOrchestrate, onDesignAudit }: FeatureListProps) {
   return (
     <div className="space-y-6">
       {/* Header */}
@@ -45,9 +46,14 @@ export default function FeatureList({ features, onSelect, onOrchestrate }: Featu
             </a>
           </div>
         </div>
-        <Button variant="primary" onClick={onOrchestrate}>
-          + Orchestrate
-        </Button>
+        <div className="flex items-center gap-2 flex-wrap">
+          <Button variant="secondary" onClick={onDesignAudit}>
+            Design Audit
+          </Button>
+          <Button variant="primary" onClick={onOrchestrate}>
+            + Orchestrate
+          </Button>
+        </div>
       </div>
 
       {/* Feature cards */}

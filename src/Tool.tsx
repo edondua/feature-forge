@@ -4,6 +4,7 @@ import type { Feature, FeatureTask, ViewRoute, OrchestrationPlan } from './types
 import FeatureList from './components/FeatureList';
 import FeatureDetail from './components/FeatureDetail';
 import OrchestrationWizard from './components/orchestration/OrchestrationWizard';
+import DesignAudit from './components/design-audit/DesignAudit';
 
 // ── Helpers ──────────────────────────────────────────────────────
 function generateId(): string {
@@ -145,6 +146,7 @@ export default function Tool() {
           features={features}
           onSelect={(id) => setRoute({ view: 'detail', featureId: id })}
           onOrchestrate={() => setRoute({ view: 'orchestrate' })}
+          onDesignAudit={() => setRoute({ view: 'design-audit' })}
         />
       )}
 
@@ -161,6 +163,13 @@ export default function Tool() {
             }
           }}
           onCancel={() => setRoute({ view: 'list' })}
+        />
+      )}
+
+      {route.view === 'design-audit' && (
+        <DesignAudit
+          apiBase={orchestrationApiBase}
+          onBack={() => setRoute({ view: 'list' })}
         />
       )}
 

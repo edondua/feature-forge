@@ -162,4 +162,5 @@ export type ViewRoute =
   | { view: 'prototype-preview'; featureId: string; state?: ScreenState }
   | { view: 'tasks'; featureId: string }
   | { view: 'orchestrate'; featureId?: string }
-  | { view: 'orchestrate-review'; planId: string };
+  | { view: 'orchestrate-review'; planId: string }
+  | { view: 'design-audit' };

@@ -1,7 +1,8 @@
 import express from 'express';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
-import { readdirSync, readFileSync, existsSync } from 'fs';
+import { readdirSync, readFileSync, existsSync, mkdirSync } from 'fs';
+import { execSync } from 'child_process';
 import { join as joinPath } from 'path';
 import dotenv from 'dotenv';
 dotenv.config({ override: true });
@@ -1298,6 +1299,935 @@ app.post('/api/webhooks/linear-design', async (req, res) => {
   } catch (err) {
     console.error('Linear webhook error:', err);
     res.status(500).json({ error: err.message || 'Webhook handler failed' });
+  }
+});
+
+// ── Design System Audit ─────────────────────────────────────────
+
+const FIGMA_API = 'https://api.figma.com/v1';
+
+function getFigmaToken() {
+  return process.env.FIGMA_ACCESS_TOKEN;
+}
+
+function extractFileKey(url) {
+  // Handles: figma.com/file/KEY/..., figma.com/design/KEY/...
+  const match = url.match(/figma\.com\/(?:file|design)\/([a-zA-Z0-9]+)/);
+  return match ? match[1] : null;
+}
+
+const SPEC_KEYWORDS = ['spec', 'specification', 'documentation', 'docs', 'anatomy', 'usage', 'guidelines'];
+
+// ── Code Scanners: find real components in iOS/Android repos ─────
+
+/** Recursively walk a directory, yielding files that match a filter */
+function walkDir(dir, filter, skipDirs = ['.', 'Pods', 'build', 'node_modules', '.git', 'DerivedData']) {
+  const results = [];
+  try {
+    const entries = readdirSync(dir, { withFileTypes: true });
+    for (const entry of entries) {
+      const fullPath = joinPath(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (!skipDirs.some(s => entry.name.startsWith(s))) {
+          results.push(...walkDir(fullPath, filter, skipDirs));
+        }
+      } else if (entry.isFile() && filter(entry.name)) {
+        results.push(fullPath);
+      }
+    }
+  } catch { /* skip unreadable dirs */ }
+  return results;
+}
+
+/**
+ * Scan an iOS repo for SwiftUI Views and UIKit components.
+ * Returns a map of component names found in code.
+ * Each entry: { name, filePath, type: 'view'|'component', props: string[] }
+ */
+function scanIOSComponents(repoPath) {
+  const components = [];
+  const swiftFiles = walkDir(repoPath, f => f.endsWith('.swift'));
+
+  for (const filePath of swiftFiles) {
+    try {
+      const content = readFileSync(filePath, 'utf8');
+
+      // SwiftUI Views: struct Foo: View
+      const viewRegex = /struct\s+(\w+)\s*:\s*(?:\w+\s*,\s*)*View\b/g;
+      let m;
+      while ((m = viewRegex.exec(content)) !== null) {
+        const name = m[1];
+        // Extract @State/@Binding properties as "props"
+        const bodyStart = content.indexOf('{', m.index);
+        const bodySlice = bodyStart > -1 ? content.slice(bodyStart, bodyStart + 2000) : '';
+        const props = [];
+        const propRegex = /@(?:State|Binding|ObservedObject|EnvironmentObject|StateObject)\s+(?:private\s+)?var\s+(\w+)\s*(?::\s*([^\n=]+))?/g;
+        let pm;
+        while ((pm = propRegex.exec(bodySlice)) !== null) {
+          props.push(pm[1] + (pm[2] ? `: ${pm[2].trim()}` : ''));
+        }
+        // Also capture init parameters
+        const initRegex = /(?:let|var)\s+(\w+)\s*:\s*([^\n{=]+)/g;
+        while ((pm = initRegex.exec(bodySlice)) !== null) {
+          if (!pm[1].startsWith('_') && !props.some(p => p.startsWith(pm[1]))) {
+            props.push(`${pm[1]}: ${pm[2].trim()}`);
+          }
+        }
+        components.push({ name, filePath: filePath.replace(repoPath + '/', ''), type: 'view', props });
+      }
+
+      // UIKit: class Foo: UIView / UIViewController / UIControl
+      const uikitRegex = /class\s+(\w+)\s*:\s*(?:UI(?:View|ViewController|Control|CollectionViewCell|TableViewCell)\b)/g;
+      while ((m = uikitRegex.exec(content)) !== null) {
+        components.push({ name: m[1], filePath: filePath.replace(repoPath + '/', ''), type: 'component', props: [] });
+      }
+    } catch { /* skip unreadable */ }
+  }
+  return components;
+}
+
+/**
+ * Scan an Android repo for Jetpack Compose composables and Android Views.
+ * Returns a map of component names found in code.
+ */
+function scanAndroidComponents(repoPath) {
+  const components = [];
+  const kotlinFiles = walkDir(repoPath, f => f.endsWith('.kt') || f.endsWith('.kts'));
+
+  for (const filePath of kotlinFiles) {
+    try {
+      const content = readFileSync(filePath, 'utf8');
+
+      // Jetpack Compose: @Composable fun Foo(...)
+      const composableRegex = /@Composable\s+(?:(?:private|internal|public)\s+)?fun\s+([A-Z]\w*)\s*\(([^)]*)\)/g;
+      let m;
+      while ((m = composableRegex.exec(content)) !== null) {
+        const name = m[1];
+        const paramsStr = m[2].trim();
+        const props = paramsStr
+          ? paramsStr.split(',').map(p => p.trim()).filter(p => p && !p.startsWith('modifier'))
+          : [];
+        components.push({ name, filePath: filePath.replace(repoPath + '/', ''), type: 'composable', props });
+      }
+
+      // Traditional Android Views: class Foo : View / FrameLayout / LinearLayout etc.
+      const viewRegex = /class\s+(\w+)\s*(?:\([\s\S]*?\))?\s*:\s*(?:View|FrameLayout|LinearLayout|RelativeLayout|ConstraintLayout|RecyclerView|CardView|AppCompatActivity|Fragment)\b/g;
+      while ((m = viewRegex.exec(content)) !== null) {
+        components.push({ name: m[1], filePath: filePath.replace(repoPath + '/', ''), type: 'view', props: [] });
+      }
+
+      // XML layout components (check layout dirs for custom views)
+    } catch { /* skip unreadable */ }
+  }
+
+  // Also scan XML layouts for custom view references
+  const xmlFiles = walkDir(repoPath, f => f.endsWith('.xml'), ['.', 'build', 'node_modules', '.git']);
+  for (const filePath of xmlFiles) {
+    if (!filePath.includes('/layout') && !filePath.includes('/layout-')) continue;
+    try {
+      const content = readFileSync(filePath, 'utf8');
+      // Custom views: <com.foo.bar.CustomView or <CustomView with capital letter
+      const customViewRegex = /<(?:[\w.]+\.)?([A-Z]\w+)(?:\s|\/|>)/g;
+      let m;
+      while ((m = customViewRegex.exec(content)) !== null) {
+        const name = m[1];
+        // Skip standard Android/Material widgets
+        const stdWidgets = new Set(['View', 'TextView', 'ImageView', 'Button', 'EditText', 'LinearLayout',
+          'RelativeLayout', 'FrameLayout', 'ConstraintLayout', 'RecyclerView', 'ScrollView',
+          'CardView', 'AppBarLayout', 'Toolbar', 'FloatingActionButton', 'BottomNavigationView',
+          'TabLayout', 'ViewPager', 'Fragment', 'include', 'merge', 'Space', 'ProgressBar',
+          'CheckBox', 'RadioButton', 'Switch', 'Spinner', 'SeekBar', 'WebView',
+          'NavigationView', 'DrawerLayout', 'CoordinatorLayout', 'CollapsingToolbarLayout',
+          'MaterialButton', 'MaterialCardView', 'TextInputLayout', 'TextInputEditText',
+          'ChipGroup', 'Chip', 'MaterialToolbar', 'BottomAppBar']);
+        if (!stdWidgets.has(name) && !components.some(c => c.name === name)) {
+          components.push({ name, filePath: filePath.replace(repoPath + '/', ''), type: 'xml-view', props: [] });
+        }
+      }
+    } catch { /* skip */ }
+  }
+
+  return components;
+}
+
+/**
+ * Detect iOS and Android repo paths from GITNEXUS_LOCAL_PATH or direct env vars.
+ */
+function detectRepoPaths() {
+  const paths = { ios: null, android: null };
+
+  // Direct paths (highest priority)
+  if (process.env.IOS_REPO_PATH && existsSync(process.env.IOS_REPO_PATH)) {
+    paths.ios = process.env.IOS_REPO_PATH;
+  }
+  if (process.env.ANDROID_REPO_PATH && existsSync(process.env.ANDROID_REPO_PATH)) {
+    paths.android = process.env.ANDROID_REPO_PATH;
+  }
+
+  // Fall back to monorepo auto-detection
+  const monoPath = process.env.GITNEXUS_LOCAL_PATH;
+  if (monoPath && existsSync(monoPath)) {
+    try {
+      const entries = readdirSync(monoPath, { withFileTypes: true });
+      for (const entry of entries) {
+        if (!entry.isDirectory()) continue;
+        const dirName = entry.name.toLowerCase();
+        const fullPath = joinPath(monoPath, entry.name);
+
+        if (!paths.ios && /ios|iphone|swift|apple/.test(dirName)) {
+          paths.ios = fullPath;
+        }
+        if (!paths.android && /android|kotlin/.test(dirName)) {
+          paths.android = fullPath;
+        }
+      }
+    } catch { /* ignore */ }
+  }
+
+  return paths;
+}
+
+/**
+ * Dedicated bare clone for the Design Audit scanner.
+ *
+ * Creates a separate bare repo (no working tree, ~50% smaller) that ONLY the scanner uses.
+ * This is completely isolated from Cyrus's repos and worktrees — different .git directory,
+ * no shared locks, zero interference no matter how many Cyrus agents are running.
+ *
+ * Layout:
+ *   ~/.feature-forge-scanner/
+ *     ios-app.git/     ← bare clone, scanner only
+ *     android-app.git/ ← bare clone, scanner only
+ */
+
+const SCANNER_DIR = joinPath(process.env.HOME || '/tmp', '.feature-forge-scanner');
+
+function ensureScannerDir() {
+  if (!existsSync(SCANNER_DIR)) {
+    mkdirSync(SCANNER_DIR, { recursive: true });
+  }
+}
+
+/**
+ * Get or create a bare clone for scanning. Returns the path to the bare repo.
+ * First call clones, subsequent calls just fetch.
+ */
+function getOrCreateBareClone(repoPath) {
+  ensureScannerDir();
+
+  // Derive a stable name from the repo path
+  const repoName = repoPath.split('/').filter(Boolean).pop() || 'repo';
+  const barePath = joinPath(SCANNER_DIR, `${repoName}.git`);
+
+  if (existsSync(barePath)) {
+    // Already exists — just fetch latest
+    try {
+      execSync('git fetch origin', { cwd: barePath, timeout: 30000, stdio: 'pipe' });
+      console.log(`[Design Audit] Fetched into bare clone: ${barePath}`);
+    } catch (err) {
+      console.warn(`[Design Audit] Bare fetch failed: ${err.message}`);
+    }
+    return barePath;
+  }
+
+  // First time — figure out the remote URL from the source repo
+  let remoteUrl;
+  try {
+    remoteUrl = execSync('git remote get-url origin', { cwd: repoPath, timeout: 5000, stdio: 'pipe' }).toString().trim();
+  } catch {
+    // If we can't get remote URL, clone from the local repo itself
+    remoteUrl = repoPath;
+  }
+
+  // Create bare clone
+  try {
+    console.log(`[Design Audit] Creating bare clone: ${remoteUrl} → ${barePath}`);
+    execSync(`git clone --bare "${remoteUrl}" "${barePath}"`, { timeout: 60000, stdio: 'pipe' });
+    return barePath;
+  } catch (err) {
+    console.error(`[Design Audit] Bare clone failed: ${err.message}`);
+    return null;
+  }
+}
+
+/**
+ * Get the default branch ref from a bare repo.
+ */
+function getDefaultRef(barePath) {
+  const candidates = ['origin/main', 'origin/master', 'main', 'master', 'HEAD'];
+  for (const ref of candidates) {
+    try {
+      execSync(`git rev-parse --verify ${ref}`, { cwd: barePath, timeout: 5000, stdio: 'pipe' });
+      return ref;
+    } catch { /* try next */ }
+  }
+  return 'HEAD';
+}
+
+/**
+ * Full safe scan flow:
+ * 1. Get or create a bare clone (isolated from Cyrus)
+ * 2. Fetch latest from origin
+ * 3. Read files from the ref
+ * Returns { barePath, ref } or null on failure.
+ */
+function prepareScannerRepo(repoPath) {
+  if (!repoPath || !existsSync(repoPath)) return null;
+
+  const barePath = getOrCreateBareClone(repoPath);
+  if (!barePath) return null;
+
+  const ref = getDefaultRef(barePath);
+  console.log(`[Design Audit] Scanner repo ready: ${barePath} @ ${ref}`);
+  return { barePath, ref };
+}
+
+/**
+ * List all files from a git ref (e.g. origin/main) without touching the working tree.
+ */
+function gitListFiles(repoPath, ref, filterFn) {
+  try {
+    const output = execSync(`git ls-tree -r --name-only ${ref}`, { cwd: repoPath, timeout: 15000, maxBuffer: 10 * 1024 * 1024, stdio: 'pipe' }).toString();
+    return output.split('\n').filter(f => f && filterFn(f));
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Read a file from a git ref without touching the working tree.
+ * e.g. git show origin/main:Sources/Views/ButtonView.swift
+ */
+function gitReadFile(repoPath, ref, filePath) {
+  try {
+    return execSync(`git show ${ref}:${filePath}`, { cwd: repoPath, timeout: 10000, maxBuffer: 5 * 1024 * 1024, stdio: 'pipe' }).toString();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Scan an iOS repo from a git ref (origin/main) — reads Swift files without
+ * touching Cyrus's working tree. Falls back to filesystem if no ref.
+ */
+function scanIOSFromRef(repoPath, ref) {
+  const SKIP = ['Pods/', 'build/', '.build/', 'DerivedData/', 'Tests/', 'Packages/'];
+  const swiftFiles = gitListFiles(repoPath, ref, f => f.endsWith('.swift') && !SKIP.some(s => f.includes(s)));
+  const components = [];
+
+  for (const filePath of swiftFiles) {
+    const content = gitReadFile(repoPath, ref, filePath);
+    if (!content || !content.includes(': View')) continue;
+
+    const viewRegex = /struct\s+(\w+)\s*:\s*(?:\w+\s*,\s*)*View\b/g;
+    let m;
+    while ((m = viewRegex.exec(content)) !== null) {
+      const name = m[1];
+      const bodyStart = content.indexOf('{', m.index);
+      const bodySlice = bodyStart > -1 ? content.slice(bodyStart, bodyStart + 2000) : '';
+      const props = [];
+      const propRegex = /@(?:State|Binding|ObservedObject|EnvironmentObject|StateObject)\s+(?:private\s+)?var\s+(\w+)\s*(?::\s*([^\n=]+))?/g;
+      let pm;
+      while ((pm = propRegex.exec(bodySlice)) !== null) {
+        props.push(pm[1] + (pm[2] ? `: ${pm[2].trim()}` : ''));
+      }
+      const initRegex = /(?:let|var)\s+(\w+)\s*:\s*([^\n{=]+)/g;
+      while ((pm = initRegex.exec(bodySlice)) !== null) {
+        if (!pm[1].startsWith('_') && !props.some(p => p.startsWith(pm[1]))) {
+          props.push(`${pm[1]}: ${pm[2].trim()}`);
+        }
+      }
+      components.push({ name, filePath, type: 'view', props });
+    }
+
+    const uikitRegex = /class\s+(\w+)\s*:\s*(?:UI(?:View|ViewController|Control|CollectionViewCell|TableViewCell)\b)/g;
+    while ((m = uikitRegex.exec(content)) !== null) {
+      components.push({ name: m[1], filePath, type: 'component', props: [] });
+    }
+  }
+  return components;
+}
+
+/**
+ * Scan an Android repo from a git ref (origin/main).
+ */
+function scanAndroidFromRef(repoPath, ref) {
+  const SKIP = ['build/', '.gradle/', '/test/', '/androidTest/'];
+  const kotlinFiles = gitListFiles(repoPath, ref, f => (f.endsWith('.kt') || f.endsWith('.kts')) && !SKIP.some(s => f.includes(s)));
+  const components = [];
+
+  for (const filePath of kotlinFiles) {
+    const content = gitReadFile(repoPath, ref, filePath);
+    if (!content) continue;
+
+    const composableRegex = /@Composable\s+(?:(?:private|internal|public)\s+)?fun\s+([A-Z]\w*)\s*\(([^)]*)\)/g;
+    let m;
+    while ((m = composableRegex.exec(content)) !== null) {
+      const paramsStr = m[2].trim();
+      const props = paramsStr
+        ? paramsStr.split(',').map(p => p.trim()).filter(p => p && !p.startsWith('modifier'))
+        : [];
+      components.push({ name: m[1], filePath, type: 'composable', props });
+    }
+
+    const viewRegex = /class\s+(\w+)\s*(?:\([\s\S]*?\))?\s*:\s*(?:View|FrameLayout|LinearLayout|RelativeLayout|ConstraintLayout)\b/g;
+    while ((m = viewRegex.exec(content)) !== null) {
+      components.push({ name: m[1], filePath, type: 'view', props: [] });
+    }
+  }
+  return components;
+}
+
+// ── GitHub API Scanner ──────────────────────────────────────────
+
+const GITHUB_API = 'https://api.github.com';
+
+function getGithubToken() {
+  return process.env.GITHUB_TOKEN;
+}
+
+/**
+ * Parse a GitHub repo URL into { owner, repo }.
+ * Handles: github.com/owner/repo, github.com/owner/repo.git, github.com/owner/repo/tree/...
+ */
+function parseGithubUrl(url) {
+  const match = url.match(/github\.com\/([^/]+)\/([^/.]+)/);
+  return match ? { owner: match[1], repo: match[2] } : null;
+}
+
+/**
+ * Fetch all files from a GitHub repo via the Trees API (recursive).
+ * Returns array of { path, sha } for files matching the filter.
+ */
+async function listGithubFiles(owner, repo, filterFn, token) {
+  const headers = { Accept: 'application/vnd.github.v3+json' };
+  if (token) headers.Authorization = `Bearer ${token}`;
+
+  // Get default branch
+  const repoResp = await fetch(`${GITHUB_API}/repos/${owner}/${repo}`, {
+    headers, signal: AbortSignal.timeout(10000),
+  });
+  if (!repoResp.ok) throw new Error(`GitHub repo fetch failed: ${repoResp.status}`);
+  const repoData = await repoResp.json();
+  const branch = repoData.default_branch || 'main';
+
+  // Get full file tree
+  const treeResp = await fetch(`${GITHUB_API}/repos/${owner}/${repo}/git/trees/${branch}?recursive=1`, {
+    headers, signal: AbortSignal.timeout(15000),
+  });
+  if (!treeResp.ok) throw new Error(`GitHub tree fetch failed: ${treeResp.status}`);
+  const treeData = await treeResp.json();
+
+  if (treeData.truncated) {
+    console.warn(`[GitHub] Tree was truncated for ${owner}/${repo} — large repo, some files may be missed`);
+  }
+
+  return (treeData.tree || [])
+    .filter(entry => entry.type === 'blob' && filterFn(entry.path))
+    .map(entry => ({ path: entry.path, sha: entry.sha }));
+}
+
+/**
+ * Fetch file content from GitHub by blob SHA (handles large files).
+ */
+async function fetchGithubFileContent(owner, repo, sha, token) {
+  const headers = { Accept: 'application/vnd.github.v3+json' };
+  if (token) headers.Authorization = `Bearer ${token}`;
+
+  const resp = await fetch(`${GITHUB_API}/repos/${owner}/${repo}/git/blobs/${sha}`, {
+    headers, signal: AbortSignal.timeout(10000),
+  });
+  if (!resp.ok) return null;
+  const data = await resp.json();
+  if (data.encoding === 'base64') {
+    return Buffer.from(data.content, 'base64').toString('utf8');
+  }
+  return data.content || null;
+}
+
+/**
+ * Scan a GitHub repo for iOS (SwiftUI/UIKit) components.
+ * Same parsing logic as local scanner, but fetches files via API.
+ */
+async function scanGithubIOSComponents(owner, repo, token) {
+  const components = [];
+  const SKIP_DIRS = ['Pods/', 'build/', '.build/', 'DerivedData/', 'Tests/', 'Packages/'];
+
+  const files = await listGithubFiles(owner, repo,
+    (path) => path.endsWith('.swift') && !SKIP_DIRS.some(d => path.includes(d)),
+    token
+  );
+
+  // Fetch content in batches of 10 to avoid rate limits
+  const BATCH_SIZE = 10;
+  for (let i = 0; i < files.length; i += BATCH_SIZE) {
+    const batch = files.slice(i, i + BATCH_SIZE);
+    const contents = await Promise.all(
+      batch.map(f => fetchGithubFileContent(owner, repo, f.sha, token).then(c => ({ ...f, content: c })))
+    );
+
+    for (const file of contents) {
+      if (!file.content || !file.content.includes(': View')) continue;
+
+      // SwiftUI Views
+      const viewRegex = /struct\s+(\w+)\s*:\s*(?:\w+\s*,\s*)*View\b/g;
+      let m;
+      while ((m = viewRegex.exec(file.content)) !== null) {
+        const props = [];
+        const bodyStart = file.content.indexOf('{', m.index);
+        const bodySlice = bodyStart > -1 ? file.content.slice(bodyStart, bodyStart + 2000) : '';
+        const propRegex = /@(?:State|Binding|ObservedObject|EnvironmentObject|StateObject)\s+(?:private\s+)?var\s+(\w+)\s*(?::\s*([^\n=]+))?/g;
+        let pm;
+        while ((pm = propRegex.exec(bodySlice)) !== null) {
+          props.push(pm[1] + (pm[2] ? `: ${pm[2].trim()}` : ''));
+        }
+        components.push({ name: m[1], filePath: file.path, type: 'view', props });
+      }
+
+      // UIKit classes
+      const uikitRegex = /class\s+(\w+)\s*:\s*(?:UI(?:View|ViewController|Control|CollectionViewCell|TableViewCell)\b)/g;
+      while ((m = uikitRegex.exec(file.content)) !== null) {
+        components.push({ name: m[1], filePath: file.path, type: 'component', props: [] });
+      }
+    }
+  }
+  return components;
+}
+
+/**
+ * Scan a GitHub repo for Android (Compose/Kotlin) components.
+ */
+async function scanGithubAndroidComponents(owner, repo, token) {
+  const components = [];
+  const SKIP_DIRS = ['build/', '.gradle/', 'test/', 'androidTest/'];
+
+  const files = await listGithubFiles(owner, repo,
+    (path) => (path.endsWith('.kt') || path.endsWith('.kts')) && !SKIP_DIRS.some(d => path.includes(d)),
+    token
+  );
+
+  const BATCH_SIZE = 10;
+  for (let i = 0; i < files.length; i += BATCH_SIZE) {
+    const batch = files.slice(i, i + BATCH_SIZE);
+    const contents = await Promise.all(
+      batch.map(f => fetchGithubFileContent(owner, repo, f.sha, token).then(c => ({ ...f, content: c })))
+    );
+
+    for (const file of contents) {
+      if (!file.content) continue;
+
+      // Jetpack Compose
+      const composableRegex = /@Composable\s+(?:(?:private|internal|public)\s+)?fun\s+([A-Z]\w*)\s*\(([^)]*)\)/g;
+      let m;
+      while ((m = composableRegex.exec(file.content)) !== null) {
+        const paramsStr = m[2].trim();
+        const props = paramsStr
+          ? paramsStr.split(',').map(p => p.trim()).filter(p => p && !p.startsWith('modifier'))
+          : [];
+        components.push({ name: m[1], filePath: file.path, type: 'composable', props });
+      }
+
+      // Traditional Views
+      const viewRegex = /class\s+(\w+)\s*(?:\([\s\S]*?\))?\s*:\s*(?:View|FrameLayout|LinearLayout|RelativeLayout|ConstraintLayout)\b/g;
+      while ((m = viewRegex.exec(file.content)) !== null) {
+        components.push({ name: m[1], filePath: file.path, type: 'view', props: [] });
+      }
+    }
+  }
+  return components;
+}
+
+/**
+ * Normalize a name for fuzzy matching: lowercase, strip common suffixes/prefixes
+ * "ButtonView" → "button", "PrimaryButton" → "primarybutton", "MD3Card" → "card"
+ */
+function normalizeName(name) {
+  return name
+    .replace(/View$|Screen$|Component$|Cell$|Widget$|Composable$|Layout$/i, '')
+    .replace(/^(?:UI|MD3|Material|Custom|App|Base)/i, '')
+    .toLowerCase()
+    .trim();
+}
+
+/**
+ * Cross-reference Figma components against code components.
+ * Returns enriched coverage for each Figma component.
+ */
+function crossReferenceCoverage(figmaComponents, iosCodeComponents, androidCodeComponents) {
+  // Build lookup maps from code components (normalized name → component[])
+  const iosMap = new Map();
+  for (const c of iosCodeComponents) {
+    const key = normalizeName(c.name);
+    if (!iosMap.has(key)) iosMap.set(key, []);
+    iosMap.get(key).push(c);
+  }
+
+  const androidMap = new Map();
+  for (const c of androidCodeComponents) {
+    const key = normalizeName(c.name);
+    if (!androidMap.has(key)) androidMap.set(key, []);
+    androidMap.get(key).push(c);
+  }
+
+  return figmaComponents.map(comp => {
+    const figmaKey = normalizeName(comp.name);
+    // Also try partial matching: "IconButton" matches "icon" + "button"
+    const figmaWords = comp.name.replace(/([A-Z])/g, ' $1').toLowerCase().trim().split(/\s+/);
+
+    // iOS match: exact normalized match OR figma name substring match
+    const iosExact = iosMap.get(figmaKey);
+    const iosFuzzy = !iosExact ? [...iosMap.entries()].find(([key]) =>
+      figmaWords.some(w => w.length > 3 && key.includes(w)) ||
+      key.split(/(?=[A-Z])/).some(w => w.length > 3 && figmaKey.includes(w.toLowerCase()))
+    ) : null;
+    const iosMatch = iosExact || (iosFuzzy ? iosFuzzy[1] : null);
+
+    // Android match
+    const androidExact = androidMap.get(figmaKey);
+    const androidFuzzy = !androidExact ? [...androidMap.entries()].find(([key]) =>
+      figmaWords.some(w => w.length > 3 && key.includes(w)) ||
+      key.split(/(?=[A-Z])/).some(w => w.length > 3 && figmaKey.includes(w.toLowerCase()))
+    ) : null;
+    const androidMatch = androidExact || (androidFuzzy ? androidFuzzy[1] : null);
+
+    // Check Figma-side spec keywords
+    const text = `${comp.name} ${comp.description}`.toLowerCase();
+    const hasSpec = SPEC_KEYWORDS.some(kw => text.includes(kw));
+
+    return {
+      ...comp,
+      platform: {
+        ios: iosMatch ? (hasSpec ? 'covered' : 'partial') : 'missing',
+        android: androidMatch ? (hasSpec ? 'covered' : 'partial') : 'missing',
+      },
+      hasSpec,
+      codeMatches: {
+        ios: iosMatch ? iosMatch.map(c => ({ name: c.name, file: c.filePath, type: c.type, props: c.props })) : [],
+        android: androidMatch ? androidMatch.map(c => ({ name: c.name, file: c.filePath, type: c.type, props: c.props })) : [],
+      },
+    };
+  });
+}
+
+// Scan a Figma file + actual code repos for design system components
+app.post('/api/design-audit/scan', async (req, res) => {
+  try {
+    const { figmaUrl, iosPath, androidPath } = req.body;
+    if (!figmaUrl) return res.status(400).json({ error: 'figmaUrl is required' });
+
+    const token = getFigmaToken();
+    if (!token) return res.status(400).json({ error: 'FIGMA_ACCESS_TOKEN not configured' });
+
+    const fileKey = extractFileKey(figmaUrl);
+    if (!fileKey) return res.status(400).json({ error: 'Could not parse Figma file key from URL' });
+
+    // ── 1. Fetch Figma components ────────────────────────────────
+    const headers = { 'X-Figma-Token': token };
+    const [fileResp, componentsResp] = await Promise.all([
+      fetch(`${FIGMA_API}/files/${fileKey}?depth=1`, { headers, signal: AbortSignal.timeout(15000) }),
+      fetch(`${FIGMA_API}/files/${fileKey}/components`, { headers, signal: AbortSignal.timeout(15000) }),
+    ]);
+
+    if (!fileResp.ok) {
+      const err = await fileResp.text();
+      return res.status(fileResp.status).json({ error: `Figma API error: ${err}` });
+    }
+    if (!componentsResp.ok) {
+      const err = await componentsResp.text();
+      return res.status(componentsResp.status).json({ error: `Figma components error: ${err}` });
+    }
+
+    const fileData = await fileResp.json();
+    const componentsData = await componentsResp.json();
+    const rawComponents = componentsData.meta?.components || [];
+
+    // Build raw Figma component list
+    const figmaComponents = rawComponents.map(c => {
+      const variants = [];
+      if (c.containing_frame?.name) {
+        const parts = c.name.split(',').map(p => p.trim());
+        for (const part of parts) {
+          const [key, val] = part.split('=').map(s => s?.trim());
+          if (key && val) {
+            variants.push({ name: key, properties: { [key]: val } });
+          }
+        }
+      }
+      return {
+        key: c.key,
+        name: c.containing_frame?.name || c.name,
+        description: c.description || '',
+        componentSetName: c.containing_frame?.name || null,
+        containingFrame: c.containing_frame?.pageName || null,
+        thumbnailUrl: c.thumbnail_url || null,
+        variants,
+      };
+    });
+
+    // Deduplicate by component set name
+    const deduped = new Map();
+    for (const comp of figmaComponents) {
+      const groupKey = comp.componentSetName || comp.name;
+      if (!deduped.has(groupKey)) {
+        deduped.set(groupKey, { ...comp, variants: [...comp.variants] });
+      } else {
+        deduped.get(groupKey).variants.push(...comp.variants);
+      }
+    }
+    const dedupedList = [...deduped.values()];
+
+    // ── 2. Scan actual code repos (GitHub API or local filesystem) ─
+    const githubToken = getGithubToken();
+    const repoPaths = detectRepoPaths();
+
+    let iosCodeComponents = [];
+    let androidCodeComponents = [];
+    let iosSource = null;
+    let androidSource = null;
+
+    // iOS: bare clone (isolated from Cyrus) → GitHub API fallback
+    const iosInput = iosPath || process.env.IOS_REPO_PATH || process.env.IOS_REPO_URL || repoPaths.ios;
+    if (iosInput) {
+      const ghParsed = parseGithubUrl(iosInput);
+      const localPath = !ghParsed ? iosInput : null;
+
+      if (localPath && existsSync(localPath)) {
+        // Local repo — create isolated bare clone, fetch, and scan from ref
+        const scanner = prepareScannerRepo(localPath);
+        if (scanner) {
+          iosCodeComponents = scanIOSFromRef(scanner.barePath, scanner.ref);
+          iosSource = `${localPath} (bare @ ${scanner.ref})`;
+        } else {
+          // Bare clone failed — fall back to direct filesystem scan
+          iosCodeComponents = scanIOSComponents(localPath);
+          iosSource = localPath;
+        }
+        console.log(`[Design Audit] Found ${iosCodeComponents.length} iOS components`);
+      } else if (ghParsed) {
+        console.log(`[Design Audit] Scanning iOS via GitHub: ${ghParsed.owner}/${ghParsed.repo}`);
+        try {
+          iosCodeComponents = await scanGithubIOSComponents(ghParsed.owner, ghParsed.repo, githubToken);
+          iosSource = `github:${ghParsed.owner}/${ghParsed.repo}`;
+          console.log(`[Design Audit] Found ${iosCodeComponents.length} iOS components from GitHub`);
+        } catch (err) {
+          console.warn(`[Design Audit] GitHub iOS scan failed: ${err.message}`);
+        }
+      }
+    }
+
+    // Android: bare clone (isolated from Cyrus) → GitHub API fallback
+    const androidInput = androidPath || process.env.ANDROID_REPO_PATH || process.env.ANDROID_REPO_URL || repoPaths.android;
+    if (androidInput) {
+      const ghParsed = parseGithubUrl(androidInput);
+      const localPath = !ghParsed ? androidInput : null;
+
+      if (localPath && existsSync(localPath)) {
+        const scanner = prepareScannerRepo(localPath);
+        if (scanner) {
+          androidCodeComponents = scanAndroidFromRef(scanner.barePath, scanner.ref);
+          androidSource = `${localPath} (bare @ ${scanner.ref})`;
+        } else {
+          androidCodeComponents = scanAndroidComponents(localPath);
+          androidSource = localPath;
+        }
+        console.log(`[Design Audit] Found ${androidCodeComponents.length} Android components`);
+      } else if (ghParsed) {
+        console.log(`[Design Audit] Scanning Android via GitHub: ${ghParsed.owner}/${ghParsed.repo}`);
+        try {
+          androidCodeComponents = await scanGithubAndroidComponents(ghParsed.owner, ghParsed.repo, githubToken);
+          androidSource = `github:${ghParsed.owner}/${ghParsed.repo}`;
+          console.log(`[Design Audit] Found ${androidCodeComponents.length} Android components from GitHub`);
+        } catch (err) {
+          console.warn(`[Design Audit] GitHub Android scan failed: ${err.message}`);
+        }
+      }
+    }
+
+    // ── 3. Cross-reference Figma ↔ Code ──────────────────────────
+    const enrichedComponents = crossReferenceCoverage(dedupedList, iosCodeComponents, androidCodeComponents);
+
+    // ── 4. Compute stats ─────────────────────────────────────────
+    const stats = {
+      total: enrichedComponents.length,
+      iosCovered: enrichedComponents.filter(c => c.platform.ios === 'covered').length,
+      iosPartial: enrichedComponents.filter(c => c.platform.ios === 'partial').length,
+      iosMissing: enrichedComponents.filter(c => c.platform.ios === 'missing').length,
+      androidCovered: enrichedComponents.filter(c => c.platform.android === 'covered').length,
+      androidPartial: enrichedComponents.filter(c => c.platform.android === 'partial').length,
+      androidMissing: enrichedComponents.filter(c => c.platform.android === 'missing').length,
+    };
+
+    res.json({
+      fileKey,
+      fileName: fileData.name || fileKey,
+      scannedAt: new Date().toISOString(),
+      components: enrichedComponents,
+      stats,
+      codeScan: {
+        ios: { path: iosSource, componentCount: iosCodeComponents.length, components: iosCodeComponents.slice(0, 100) },
+        android: { path: androidSource, componentCount: androidCodeComponents.length, components: androidCodeComponents.slice(0, 100) },
+      },
+    });
+  } catch (err) {
+    console.error('Design audit scan error:', err);
+    res.status(500).json({ error: err.message || 'Scan failed' });
+  }
+});
+
+// Generate a full Uber-style spec for a component
+app.post('/api/design-audit/generate-spec', async (req, res) => {
+  try {
+    const { component, platform } = req.body;
+    if (!component?.name || !platform) {
+      return res.status(400).json({ error: 'component and platform are required' });
+    }
+
+    const client = await getAnthropicClient();
+
+    const variantList = (component.variants || [])
+      .map(v => `  - ${v.name}: ${JSON.stringify(v.properties)}`)
+      .join('\n') || '  (no variants detected)';
+
+    // Include actual code context if available
+    const codeMatches = component.codeMatches?.[platform] || [];
+    const codeContext = codeMatches.length > 0
+      ? `\n\n## Existing Code Implementation\nThis component HAS a real implementation in the codebase:\n${
+        codeMatches.map(c => `- ${c.name} (${c.type}) in ${c.file}${c.props?.length ? `\n  Props: ${c.props.join(', ')}` : ''}`).join('\n')
+      }\nUse these real prop names and types in the spec.`
+      : '\n\nNo existing code implementation found — generate spec based on Figma design.';
+
+    const platformContext = platform === 'ios'
+      ? 'Target: iOS (SwiftUI / UIKit). Follow Apple HIG. Use SF Symbols for icons. Reference Dynamic Type for typography.'
+      : 'Target: Android (Jetpack Compose / Material 3). Follow Material Design 3 guidelines. Use Material Icons. Reference Material typography scale.';
+
+    const response = await client.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 4096,
+      system: `You are a design system engineer generating comprehensive component specifications in the style of Uber's Base design system (uSpec). Output ONLY valid JSON.
+
+${platformContext}
+
+Generate a complete spec covering:
+1. Anatomy — the visual parts of the component
+2. Props/API — all configurable properties (use real prop names from code if available)
+3. Variants — all visual/behavioral variants
+4. Colors — design tokens used
+5. Spacing — padding, margins, gaps
+6. Accessibility — WCAG requirements, labels, roles`,
+      messages: [{
+        role: 'user',
+        content: `Generate a full ${platform.toUpperCase()} spec for this design system component:
+
+Name: ${component.name}
+Description: ${component.description || '(none)'}
+Component Set: ${component.componentSetName || '(standalone)'}
+Page: ${component.containingFrame || '(unknown)'}
+Detected Variants:
+${variantList}${codeContext}
+
+Return JSON matching this structure:
+{
+  "anatomy": [{ "name": "string", "description": "string", "required": boolean }],
+  "props": [{ "name": "string", "type": "string", "defaultValue": "string", "description": "string", "platform": "${platform}" }],
+  "variants": [{ "name": "string", "values": ["string"], "description": "string" }],
+  "colors": [{ "token": "string", "hex": "string", "usage": "string" }],
+  "spacing": [{ "property": "string", "value": "string", "description": "string" }],
+  "accessibility": [{ "rule": "string", "wcagLevel": "A"|"AA"|"AAA", "description": "string" }],
+  "usageGuidelines": "string"
+}`,
+      }],
+    });
+
+    const text = response.content.find(c => c.type === 'text')?.text || '';
+    const jsonMatch = text.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) {
+      return res.status(500).json({ error: 'Failed to parse spec from AI response' });
+    }
+
+    const specData = JSON.parse(jsonMatch[0]);
+
+    const spec = {
+      componentKey: component.key,
+      componentName: component.name,
+      platform,
+      generatedAt: new Date().toISOString(),
+      ...specData,
+    };
+
+    res.json({ spec });
+  } catch (err) {
+    console.error('Spec generation error:', err);
+    res.status(500).json({ error: err.message || 'Spec generation failed' });
+  }
+});
+
+// Push missing specs to Linear as tickets
+app.post('/api/design-audit/push-to-linear', async (req, res) => {
+  try {
+    const { components, teamId, specs } = req.body;
+    if (!components?.length || !teamId) {
+      return res.status(400).json({ error: 'components and teamId are required' });
+    }
+
+    const client = await getLinearClient();
+    const results = [];
+
+    for (const comp of components) {
+      try {
+        const missingPlatforms = [];
+        if (comp.platform.ios !== 'covered') missingPlatforms.push('iOS');
+        if (comp.platform.android !== 'covered') missingPlatforms.push('Android');
+
+        // Find generated spec for this component if available
+        const compSpecs = (specs || []).filter(s => s.componentKey === comp.key);
+        let specBody = '';
+        if (compSpecs.length > 0) {
+          for (const spec of compSpecs) {
+            specBody += `\n### ${spec.platform.toUpperCase()} Spec (Auto-Generated)\n`;
+            specBody += `\n**Anatomy**\n${spec.anatomy.map(a => `- **${a.name}** ${a.required ? '(required)' : '(optional)'}: ${a.description}`).join('\n')}\n`;
+            specBody += `\n**Props**\n| Name | Type | Default | Description |\n|------|------|---------|-------------|\n`;
+            specBody += spec.props.map(p => `| ${p.name} | ${p.type} | ${p.defaultValue} | ${p.description} |`).join('\n');
+            specBody += `\n\n**Variants**\n${spec.variants.map(v => `- **${v.name}**: ${v.values.join(', ')} — ${v.description}`).join('\n')}\n`;
+            specBody += `\n**Colors**\n${spec.colors.map(c => `- \`${c.token}\` (${c.hex}): ${c.usage}`).join('\n')}\n`;
+            specBody += `\n**Spacing**\n${spec.spacing.map(s => `- ${s.property}: ${s.value} — ${s.description}`).join('\n')}\n`;
+            specBody += `\n**Accessibility**\n${spec.accessibility.map(a => `- [${a.wcagLevel}] ${a.rule}: ${a.description}`).join('\n')}\n`;
+            specBody += `\n**Usage Guidelines**\n${spec.usageGuidelines}\n`;
+          }
+        }
+
+        const description = [
+          `## Missing Design Specs`,
+          `Component **${comp.name}** is missing specs for: ${missingPlatforms.join(', ')}`,
+          '',
+          comp.description ? `**Description:** ${comp.description}` : '',
+          comp.variants?.length ? `**Known Variants:** ${comp.variants.map(v => v.name).join(', ')}` : '',
+          specBody,
+          '---',
+          '*Generated by Feature Forge Design Audit*',
+        ].filter(Boolean).join('\n');
+
+        const issue = await client.createIssue({
+          teamId,
+          title: `[Design Spec] ${comp.name} — ${missingPlatforms.join(' + ')}`,
+          description,
+          priority: 3,
+        });
+
+        const issueData = await issue.issue;
+        results.push({ componentKey: comp.key, linearId: issueData.id, url: issueData.url, success: true });
+      } catch (err) {
+        results.push({ componentKey: comp.key, success: false, error: err.message });
+      }
+    }
+
+    res.json({
+      success: true,
+      results,
+      summary: `Created ${results.filter(r => r.success).length}/${results.length} tickets`,
+    });
+  } catch (err) {
+    console.error('Design audit Linear push error:', err);
+    res.status(500).json({ error: err.message || 'Failed to push to Linear' });
   }
 });
 
