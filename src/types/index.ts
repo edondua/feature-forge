@@ -11,6 +11,10 @@ export type {
   TaskGraphEdge,
   OrchestrationStep,
   OrchestrationPlan,
+  ProposalStyle,
+  DesignScreen,
+  DesignProposal,
+  DesignProposalsResult,
 } from './orchestration';
 
 // ── Execution Modes ──────────────────────────────────────────────

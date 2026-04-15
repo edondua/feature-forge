@@ -1,9 +1,10 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useMemo } from 'react';
 import { Button, Badge } from '@appmirror/ui-kit';
 import type { FeatureIntake, OrchestrationPlan } from '../../types';
 import IntakeForm from './IntakeForm';
 import AnalyzingState from './AnalyzingState';
 import PlanReview from './PlanReview';
+import DesignProposalsPanel from './DesignProposalsPanel';
 import LinearPushPanel from './LinearPushPanel';
 
 interface OrchestrationWizardProps {
@@ -13,20 +14,29 @@ interface OrchestrationWizardProps {
   onCancel: () => void;
 }
 
-type Step = 'intake' | 'analyzing' | 'review' | 'push' | 'done';
-
-const STEPS: { key: Step; label: string }[] = [
-  { key: 'intake', label: 'Intake' },
-  { key: 'analyzing', label: 'Analyze' },
-  { key: 'review', label: 'Review' },
-  { key: 'push', label: 'Linear' },
-];
+type Step = 'intake' | 'analyzing' | 'review' | 'design-proposals' | 'push' | 'done';
 
 export default function OrchestrationWizard({ featureId, apiBase, onComplete, onCancel }: OrchestrationWizardProps) {
   const [step, setStep] = useState<Step>('intake');
   const [plan, setPlan] = useState<OrchestrationPlan | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [refining, setRefining] = useState(false);
+
+  // Dynamic steps — include "Design" only when design lane is active
+  const hasDesignLane = plan?.laneDecisions?.some(l => l.lane === 'design' && l.needed) ?? false;
+
+  const steps = useMemo(() => {
+    const base: { key: Step; label: string }[] = [
+      { key: 'intake', label: 'Intake' },
+      { key: 'analyzing', label: 'Analyze' },
+      { key: 'review', label: 'Review' },
+    ];
+    if (hasDesignLane) {
+      base.push({ key: 'design-proposals', label: 'Design' });
+    }
+    base.push({ key: 'push', label: 'Linear' });
+    return base;
+  }, [hasDesignLane]);
 
   const handleIntakeSubmit = useCallback(async (intake: FeatureIntake, services: string[], _targetMode: string) => {
     setStep('analyzing');
@@ -76,8 +86,19 @@ export default function OrchestrationWizard({ featureId, apiBase, onComplete, on
   const handleApprove = useCallback(() => {
     if (!plan) return;
     setPlan({ ...plan, step: 'approved' });
-    setStep('push');
+    // Route to design proposals if design lane is active, otherwise straight to push
+    const needsDesign = plan.laneDecisions.some(l => l.lane === 'design' && l.needed);
+    setStep(needsDesign ? 'design-proposals' : 'push');
   }, [plan]);
+
+  const handleDesignProposalSelected = useCallback((updatedPlan: OrchestrationPlan) => {
+    setPlan(updatedPlan);
+    setStep('push');
+  }, []);
+
+  const handleSkipDesign = useCallback(() => {
+    setStep('push');
+  }, []);
 
   const handlePushComplete = useCallback((projectUrl: string) => {
     if (!plan) return;
@@ -87,13 +108,13 @@ export default function OrchestrationWizard({ featureId, apiBase, onComplete, on
     onComplete(updated);
   }, [plan, onComplete]);
 
-  const currentStepIndex = STEPS.findIndex(s => s.key === step);
+  const currentStepIndex = steps.findIndex(s => s.key === step);
 
   return (
     <div className="space-y-6">
       {/* Step indicator */}
       <div className="flex items-center gap-2">
-        {STEPS.map((s, i) => {
+        {steps.map((s, i) => {
           const isActive = s.key === step;
           const isDone = i < currentStepIndex || step === 'done';
           return (
@@ -149,6 +170,15 @@ export default function OrchestrationWizard({ featureId, apiBase, onComplete, on
           onRefine={handleRefine}
           onUpdatePlan={setPlan}
           refining={refining}
+        />
+      )}
+
+      {step === 'design-proposals' && plan && (
+        <DesignProposalsPanel
+          plan={plan}
+          apiBase={apiBase}
+          onProposalSelected={handleDesignProposalSelected}
+          onSkip={handleSkipDesign}
         />
       )}
 

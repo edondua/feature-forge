@@ -54,6 +54,22 @@ async function getLinearClient() {
   return linearClient;
 }
 
+// ── Stitch SDK (lazy-loaded) ───────────────────────────────────
+let stitchModule = null;
+
+async function getStitchModule() {
+  if (!process.env.STITCH_API_KEY) return null;
+  if (!stitchModule) {
+    try {
+      stitchModule = await import('@google/stitch-sdk');
+    } catch (err) {
+      console.warn('Stitch SDK not available:', err.message);
+      return null;
+    }
+  }
+  return stitchModule;
+}
+
 function generateId() {
   return `ot_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 }
@@ -802,6 +818,36 @@ app.post('/api/orchestrate/push-to-linear', async (req, res) => {
         const childData = await childIssue.issue;
         linearIdMap[task.id] = childData.id;
         results.push({ type: 'task', taskId: task.id, linearId: childData.id, url: childData.url, success: true });
+
+        // Attach Stitch design proposals to design-lane issues
+        if (task.lane === 'design' && plan.designProposals) {
+          const selectedProposal = plan.designProposals.proposals.find(p => p.selected);
+          if (selectedProposal) {
+            try {
+              const commentLines = [
+                `## 🎨 Selected Design Proposal: ${selectedProposal.label}`,
+                `*${selectedProposal.rationale}*`,
+                '',
+              ];
+              if (plan.designProposals.stitchProjectUrl) {
+                commentLines.push(`**Stitch Project:** [Open in Stitch](${plan.designProposals.stitchProjectUrl})`);
+                commentLines.push('');
+              }
+              for (const screen of selectedProposal.screens) {
+                commentLines.push(`### ${screen.name}`);
+                if (screen.imageUrl) commentLines.push(`![${screen.name}](${screen.imageUrl})`);
+                if (screen.htmlUrl) commentLines.push(`[Import to Figma (HTML)](${screen.htmlUrl})`);
+                commentLines.push('');
+              }
+              await client.createComment({
+                issueId: childData.id,
+                body: commentLines.join('\n'),
+              });
+            } catch (commentErr) {
+              console.warn('Failed to attach design proposal comment:', commentErr.message);
+            }
+          }
+        }
       } catch (err) {
         results.push({ type: 'task', taskId: task.id, success: false, error: err.message });
       }
@@ -834,6 +880,424 @@ app.post('/api/orchestrate/push-to-linear', async (req, res) => {
   } catch (err) {
     console.error('Linear push error:', err);
     res.status(500).json({ error: err.message || 'Failed to push to Linear' });
+  }
+});
+
+// ── Design System Context (injected into proposal prompts) ──────
+
+function buildDesignSystemContext() {
+  return `## iOS Design System Reference
+
+### Color Tokens
+- Primary Blue: #007AFF (interactive elements, links, tint)
+- Success Green: #34C759 (toggles on, confirmations)
+- Destructive Red: #FF3B30 (delete, error, destructive buttons)
+- Warning Orange: #FF9500 (warnings, attention)
+- Gray: #8E8E93 (secondary text, captions)
+- Gray3: #C7C7CC (light borders)
+- Gray5: #E5E5EA (subtle backgrounds)
+- Gray6 / Grouped BG: #F2F2F7 (screen background, section bg)
+- Separator: #C6C6C8 (0.5px hairline dividers)
+- Card BG: #FFFFFF
+- Black: #000000 (primary text)
+
+### Typography (SF Pro family)
+- Large Title: 34px, weight 700, letter-spacing -0.4px
+- Title: 17px, weight 600 (NavBar titles, section headers)
+- Body: 17px, weight 400 (standard text)
+- Caption: 13px, weight 400, gray color
+- Section Header: 13px, weight 400, uppercase, letter-spacing 0.5px
+
+### Component Library
+1. **Screen** — Full-screen container, background #F2F2F7
+2. **NavBar** — Top bar with back button, center title (17px semibold), optional right action
+3. **LargeTitle** — 34px bold header, 16px horizontal padding
+4. **Section** — Grouped list container with optional header/footer captions, 12px radius white cards
+5. **Row** — List cell: optional icon (29x29, 6px radius) + label + detail text/chevron/toggle/image(40px circle). Padding 11px 16px, gap 12px
+6. **TextField** — Text input, placeholder in gray, optional secure mode
+7. **IOSButton** — Styles: filled (blue bg, white text) | tinted (18% opacity bg) | plain (text only). Radius 12px, padding 14px 20px. Can be destructive (red) or full-width
+8. **SearchBar** — Search icon + input field, gray6 bg, radius 10px
+9. **TabBar** — Bottom nav with frosted glass bg (blur 20px). Tabs have icon + label. Active: #007AFF, inactive: #8E8E93
+10. **SegmentedControl** — Pill selector, radius 8px outer / 6px segment
+11. **IOSCard** — Card wrapper, optional 16px padding
+12. **Alert** — Modal dialog, backdrop blur 20px, max-width 270px, radius 14px. Buttons: default/cancel/destructive
+13. **EmptyState** — Centered: 56px icon + title + message + optional action button
+14. **Spacer** — Vertical spacing, default 16px
+
+### Layout Patterns
+- Screen horizontal padding: 16px
+- Section margin bottom: 24px
+- Row gap (icon to text): 12px
+- Card/section border radius: 12px
+- Standard spacing rhythm: 4/8/12/16/20/24px
+- Device target: iPhone 15 Pro (390x844 logical points)
+
+### Interaction Patterns
+- Navigation: push/pop stack with back button in NavBar
+- Toggles: 51x31px switch, #34C759 when on
+- Chevron rows: indicate drill-down navigation
+- Bottom TabBar: 3-5 tabs for primary navigation
+- Pull-to-refresh on scrollable lists
+- Swipe-to-delete on list rows
+- Grouped sections for settings-style layouts`;
+}
+
+// ── Design Proposals API ───────────────────────────────────────
+
+app.post('/api/orchestrate/design-proposals', async (req, res) => {
+  try {
+    const { plan } = req.body;
+    if (!plan?.intake) {
+      return res.status(400).json({ error: 'Plan with intake is required' });
+    }
+
+    const designTasks = (plan.tasks || []).filter(t => t.lane === 'design');
+    const intake = plan.intake;
+
+    // Build Claude prompt for 3 UX proposals
+    const client = await getAnthropicClient();
+    const designContext = buildDesignSystemContext();
+
+    const systemPrompt = `You are a senior UX/UI designer specializing in iOS mobile applications. You create detailed, production-ready screen designs that adhere strictly to an established design system.
+
+${designContext}
+
+## Your Task
+Given a feature description, create exactly 3 distinct UX/UI proposals. Each proposal takes a different design philosophy:
+
+1. **Minimal** — Clean, focused, fewer screens. Prioritizes simplicity and speed. Uses the fewest components necessary. Best for power users who want efficiency.
+
+2. **Feature-rich** — Comprehensive, detailed, more screens. Surfaces all functionality upfront. Uses sections, cards, toggles, and detailed rows. Best for users who want full control.
+
+3. **Conversational** — Guided, step-by-step, wizard-like. Breaks complex tasks into simple steps. Uses large titles, spacers, focused inputs per screen. Best for new users or complex onboarding.
+
+## Output Format
+Return a JSON object:
+{
+  "proposals": [
+    {
+      "style": "minimal",
+      "label": "Minimal — [2-3 word summary]",
+      "rationale": "[1-2 sentences explaining why this approach works for this feature]",
+      "screens": [
+        {
+          "name": "[Screen Name]",
+          "prompt": "[Detailed Stitch prompt: describe the EXACT layout using the iOS components above. Reference specific components by name (NavBar, Section, Row, TabBar, etc.), specify colors by hex code, describe each element's content and state. Be extremely specific — this prompt drives an AI design tool to generate the actual screen.]"
+        }
+      ]
+    }
+  ]
+}
+
+## Prompt Writing Rules
+- Each screen prompt MUST reference specific iOS components from the design system
+- Include exact text content for labels, placeholders, button titles
+- Specify icon emojis for Row icons and TabBar items
+- Describe the full visual hierarchy from top (NavBar) to bottom (TabBar or button)
+- For navigation flows, mention what screen each button/row leads to
+- Keep prompts under 500 words but be precise about every visible element`;
+
+    const userMessage = `## Feature: ${intake.title}
+
+**Problem:** ${intake.problem}
+**Goal:** ${intake.goal}
+**User Impact:** ${intake.userImpact}
+**Affected Surfaces:** ${intake.affectedSurfaces.join(', ')}
+**In Scope:** ${intake.inScope.join('; ')}
+${intake.outOfScope.length > 0 ? `**Out of Scope:** ${intake.outOfScope.join('; ')}` : ''}
+
+${designTasks.length > 0 ? `## Existing Design Tasks\n${designTasks.map(t => `- **${t.title}**: ${t.description}\n  Acceptance: ${(t.acceptanceCriteria || []).join('; ')}`).join('\n')}` : ''}
+
+Create 3 proposals with appropriate screen flows for this feature.`;
+
+    const response = await client.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 8192,
+      system: systemPrompt,
+      messages: [{ role: 'user', content: userMessage }],
+    });
+
+    // Extract JSON from Claude's response
+    const text = response.content[0]?.text || '';
+    const jsonMatch = text.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) {
+      return res.status(500).json({ error: 'Failed to parse Claude response as JSON' });
+    }
+
+    const parsed = JSON.parse(jsonMatch[0]);
+    const proposals = parsed.proposals || [];
+
+    // Build the result
+    const result = {
+      planId: plan.id,
+      featureTitle: intake.title,
+      stitchProjectId: null,
+      stitchProjectUrl: null,
+      proposals: [],
+      designSystemSynced: false,
+      createdAt: new Date().toISOString(),
+    };
+
+    // Try to generate screens in Stitch
+    const stitchMod = await getStitchModule();
+    let stitchProject = null;
+
+    if (stitchMod) {
+      try {
+        const { stitch } = stitchMod;
+
+        // Create a Stitch project for this feature
+        const projectResult = await stitch.callTool('create_project', {
+          title: `${intake.title} — UX Proposals`,
+        });
+        const projectId = projectResult?.projectId || projectResult?.id;
+
+        if (projectId) {
+          stitchProject = stitch.project(projectId);
+          result.stitchProjectId = projectId;
+          result.stitchProjectUrl = `https://stitch.withgoogle.com/project/${projectId}`;
+
+          // Sync design system tokens
+          try {
+            await stitchProject.createDesignSystem({
+              name: 'iOS Design System',
+              colors: {
+                primary: '#007AFF',
+                success: '#34C759',
+                destructive: '#FF3B30',
+                warning: '#FF9500',
+                secondary: '#8E8E93',
+                background: '#F2F2F7',
+                card: '#FFFFFF',
+                separator: '#C6C6C8',
+              },
+              typography: {
+                fontFamily: '-apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Helvetica Neue", sans-serif',
+                scale: {
+                  largeTitle: { size: '34px', weight: '700' },
+                  title: { size: '17px', weight: '600' },
+                  body: { size: '17px', weight: '400' },
+                  caption: { size: '13px', weight: '400' },
+                },
+              },
+              spacing: { unit: '8px', scale: [4, 8, 12, 16, 20, 24, 32] },
+              borderRadius: { card: '12px', button: '12px', input: '10px', alert: '14px' },
+            });
+            result.designSystemSynced = true;
+          } catch (dsErr) {
+            console.warn('Stitch design system sync failed (non-blocking):', dsErr.message);
+          }
+        }
+      } catch (projErr) {
+        console.warn('Stitch project creation failed (falling back to prompts only):', projErr.message);
+      }
+    }
+
+    // Process each proposal: assign IDs and optionally generate Stitch screens
+    for (let pi = 0; pi < proposals.length; pi++) {
+      const raw = proposals[pi];
+      const proposal = {
+        id: generateId(),
+        style: raw.style,
+        label: raw.label,
+        rationale: raw.rationale,
+        screens: [],
+        selected: false,
+      };
+
+      // Generate each screen (in parallel within a proposal if Stitch is available)
+      const screenPromises = (raw.screens || []).map(async (rawScreen, si) => {
+        const screen = {
+          screenId: `${proposal.id}_s${si}`,
+          name: rawScreen.name,
+          prompt: rawScreen.prompt,
+          stitchScreenId: null,
+          imageUrl: null,
+          htmlUrl: null,
+        };
+
+        if (stitchProject) {
+          try {
+            const generated = await stitchProject.generate(rawScreen.prompt, 'iphone-15-pro');
+            if (generated) {
+              screen.stitchScreenId = generated.id || generated.screenId;
+              const [imgResult, htmlResult] = await Promise.all([
+                generated.getImage().catch(() => null),
+                generated.getHtml().catch(() => null),
+              ]);
+              screen.imageUrl = imgResult;
+              screen.htmlUrl = htmlResult;
+            }
+          } catch (genErr) {
+            console.warn(`Stitch generation failed for ${rawScreen.name}:`, genErr.message);
+          }
+        }
+
+        return screen;
+      });
+
+      proposal.screens = await Promise.all(screenPromises);
+      result.proposals.push(proposal);
+    }
+
+    res.json({ designProposals: result });
+  } catch (err) {
+    console.error('Design proposals error:', err);
+    res.status(500).json({ error: err.message || 'Failed to generate design proposals' });
+  }
+});
+
+app.post('/api/orchestrate/design-proposals/regenerate', async (req, res) => {
+  try {
+    const { stitchProjectId, screenPrompt, deviceType } = req.body;
+    if (!screenPrompt) {
+      return res.status(400).json({ error: 'screenPrompt is required' });
+    }
+
+    const stitchMod = await getStitchModule();
+    if (!stitchMod || !stitchProjectId) {
+      return res.status(400).json({ error: 'Stitch is not configured or no projectId provided' });
+    }
+
+    const { stitch } = stitchMod;
+    const project = stitch.project(stitchProjectId);
+    const generated = await project.generate(screenPrompt, deviceType || 'iphone-15-pro');
+
+    const [imageUrl, htmlUrl] = await Promise.all([
+      generated.getImage().catch(() => null),
+      generated.getHtml().catch(() => null),
+    ]);
+
+    res.json({
+      stitchScreenId: generated.id || generated.screenId,
+      imageUrl,
+      htmlUrl,
+    });
+  } catch (err) {
+    console.error('Screen regeneration error:', err);
+    res.status(500).json({ error: err.message || 'Failed to regenerate screen' });
+  }
+});
+
+// ── Linear Webhook — External Design Trigger ───────────────────
+
+app.post('/api/webhooks/linear-design', async (req, res) => {
+  try {
+    // Verify webhook signature if configured
+    const secret = process.env.LINEAR_WEBHOOK_SECRET;
+    if (secret) {
+      const { createHmac } = await import('crypto');
+      const signature = req.headers['linear-signature'];
+      const expected = createHmac('sha256', secret).update(JSON.stringify(req.body)).digest('hex');
+      if (signature !== expected) {
+        return res.status(401).json({ error: 'Invalid webhook signature' });
+      }
+    }
+
+    const { action, type, data } = req.body;
+
+    // Only handle new issue creation
+    if (type !== 'Issue' || action !== 'create') {
+      return res.json({ ignored: true, reason: 'Not an issue creation event' });
+    }
+
+    // Check for design lane label
+    const labels = data?.labels || [];
+    const isDesignLane = labels.some(l => l.name === 'lane:design');
+    if (!isDesignLane) {
+      return res.json({ ignored: true, reason: 'No lane:design label found' });
+    }
+
+    // Build a synthetic plan from the issue data
+    const syntheticIntake = {
+      title: data.title || 'Untitled',
+      workType: 'feature',
+      problem: data.description || '',
+      goal: data.description || '',
+      userImpact: '',
+      businessImpact: '',
+      successMetric: '',
+      inScope: [],
+      outOfScope: [],
+      linkedReferences: [],
+      affectedSurfaces: ['design', 'ios'],
+    };
+
+    const syntheticPlan = {
+      id: generateId(),
+      featureId: data.id,
+      step: 'review',
+      intake: syntheticIntake,
+      laneDecisions: [{ lane: 'design', needed: true, reasoning: 'Triggered via Linear webhook', services: [], repos: [] }],
+      tasks: [{
+        id: generateId(),
+        title: data.title,
+        description: data.description || '',
+        serviceId: 'none',
+        lane: 'design',
+        status: 'pending',
+        dependsOn: [],
+        blockedBy: [],
+        mode: 'production',
+        debtTags: [],
+        acceptanceCriteria: [],
+        riskFlags: [],
+        order: 0,
+      }],
+      taskGraph: [],
+      reviewNotes: [],
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+
+    // Generate proposals using the same pipeline
+    const proposalRes = await fetch(`http://localhost:${PORT}/api/orchestrate/design-proposals`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ plan: syntheticPlan }),
+    });
+
+    const proposalData = await proposalRes.json();
+    const proposals = proposalData?.designProposals;
+
+    if (proposals && proposals.proposals?.length > 0) {
+      // Post results as a comment on the Linear issue
+      const linearClient = await getLinearClient();
+      const commentLines = [
+        `## 🎨 Design Proposals (Auto-generated)`,
+        ``,
+        `**Feature:** ${syntheticIntake.title}`,
+        proposals.stitchProjectUrl ? `**Stitch Project:** [Open in Stitch](${proposals.stitchProjectUrl})` : '',
+        ``,
+      ];
+
+      for (const proposal of proposals.proposals) {
+        commentLines.push(`### ${proposal.label}`);
+        commentLines.push(`*${proposal.rationale}*`);
+        commentLines.push('');
+        for (const screen of proposal.screens) {
+          commentLines.push(`**${screen.name}**`);
+          if (screen.imageUrl) {
+            commentLines.push(`![${screen.name}](${screen.imageUrl})`);
+          }
+          if (screen.htmlUrl) {
+            commentLines.push(`[Import to Figma (HTML)](${screen.htmlUrl})`);
+          }
+          commentLines.push('');
+        }
+        commentLines.push('---');
+      }
+
+      await linearClient.createComment({
+        issueId: data.id,
+        body: commentLines.filter(Boolean).join('\n'),
+      });
+    }
+
+    res.json({ success: true, proposals: proposals?.proposals?.length || 0 });
+  } catch (err) {
+    console.error('Linear webhook error:', err);
+    res.status(500).json({ error: err.message || 'Webhook handler failed' });
   }
 });
 

@@ -84,11 +84,43 @@ export interface TaskGraphEdge {
   type: 'blocks' | 'informs';
 }
 
+// ── Design Proposals ────────────────────────────────────────────
+export type ProposalStyle = 'minimal' | 'feature-rich' | 'conversational';
+
+export interface DesignScreen {
+  screenId: string;
+  name: string;
+  prompt: string;
+  stitchScreenId?: string;
+  imageUrl?: string;
+  htmlUrl?: string;
+}
+
+export interface DesignProposal {
+  id: string;
+  style: ProposalStyle;
+  label: string;
+  rationale: string;
+  screens: DesignScreen[];
+  selected: boolean;
+}
+
+export interface DesignProposalsResult {
+  planId: string;
+  featureTitle: string;
+  stitchProjectId?: string;
+  stitchProjectUrl?: string;
+  proposals: DesignProposal[];
+  designSystemSynced: boolean;
+  createdAt: string;
+}
+
 // ── Orchestration Plan ──────────────────────────────────────────
 export type OrchestrationStep =
   | 'intake'
   | 'analyzing'
   | 'review'
+  | 'design-proposals'
   | 'approved'
   | 'pushing'
   | 'pushed';
@@ -101,6 +133,7 @@ export interface OrchestrationPlan {
   laneDecisions: LaneDecision[];
   tasks: OrchestrationTask[];
   taskGraph: TaskGraphEdge[];
+  designProposals?: DesignProposalsResult;
   linearProjectId?: string;
   linearProjectUrl?: string;
   reviewNotes: string[];
